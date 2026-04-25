@@ -6,8 +6,8 @@
 const ZONAS = ['TT', 'A1', 'A2', 'A3', 'M.AER', 'LAN', 'M.ANA', 'VEL', 'PML', 'TL'];
 const DIAS = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo'];
 const DIAS_SHORT = ['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb', 'Dom'];
-const STORE_KEY = 'swim_coach_v4_live';
-const OLD_STORE_KEYS = ['swim_coach_v3', 'swim_coach_v2', 'swimcoach_v2'];
+const STORE_KEY = 'swim_coach_v5_phase3';
+const OLD_STORE_KEYS = ['swim_coach_v4_live', 'swim_coach_v3', 'swim_coach_v2', 'swimcoach_v2'];
 
 const COL = {
   day: 0,
@@ -325,7 +325,7 @@ function buildExerciseSnapshot(dayIdx, sess, idx) {
   const entry = getExerciseEntries(dayIdx, sess).find((e) => e.idx === Number(idx));
   if (!entry) return null;
   const ex = entry.ex;
-  return {
+  const snap = {
     id: entry.id,
     dayIdx,
     sess,
@@ -341,6 +341,8 @@ function buildExerciseSnapshot(dayIdx, sess, idx) {
     target: ex.target || '',
     pool: getPool(dayIdx),
   };
+  snap.structure = inferExerciseStructure(snap);
+  return snap;
 }
 
 function getSelectedExercise() {
@@ -412,28 +414,132 @@ function getTimingExercise() {
   return getSelectedExercise();
 }
 
-function exercisePattern(snapshot) {
+function inferExerciseStructure(snapshot) {
   if (!snapshot) return null;
-  const txt = `${snapshot.desc || ''} ${snapshot.metros || ''}`;
-  const m = txt.match(/(\d{1,2})\s*(?:x|×)\s*(\d{2,4})/i);
-  if (m) {
-    const reps = Number(m[1]);
-    const repDistance = Number(m[2]);
-    if (reps > 0 && repDistance > 0) return { reps, repDistance, source: 'auto' };
+  const txt = `${snapshot.desc || ''}`;
+  const simple = txt.match(/(?:^|\s)(\d{1,3})\s*(?:x|×)\s*(\d{1,4})(?=\D|$)/i);
+  if (simple) {
+    const repetitions = Number(simple[1]);
+    const distancePerRep = Number(simple[2]);
+    if (repetitions > 0 && distancePerRep > 0) {
+      return {
+        repetitions,
+        distancePerRep,
+        totalDistance: repetitions * distancePerRep,
+        source: 'auto',
+        detectedAutomatically: true,
+      };
+    }
   }
+
   const meters = parseMeters(snapshot.metros);
-  if (meters > 0) return { reps: 1, repDistance: meters, source: 'meters' };
-  return null;
+  if (meters > 0) {
+    return {
+      repetitions: 1,
+      distancePerRep: meters,
+      totalDistance: meters,
+      source: 'meters',
+      detectedAutomatically: false,
+    };
+  }
+
+  return {
+    repetitions: 0,
+    distancePerRep: 0,
+    totalDistance: 0,
+    source: 'unknown',
+    detectedAutomatically: false,
+  };
 }
 
-function splitMeta(splitNo, splitDistance, snapshot) {
-  const pattern = exercisePattern(snapshot);
+function normalizeExerciseStructure(structure, snapshot, splitDistance = currentSplitDistance()) {
+  const base = structure || inferExerciseStructure(snapshot);
+  const repetitions = Number(base?.repetitions ?? base?.reps ?? 0) || 0;
+  const distancePerRep = Number(base?.distancePerRep ?? base?.repDistance ?? 0) || 0;
+  const snapshotMeters = parseMeters(snapshot?.metros);
+  const totalDistance = repetitions > 0 && distancePerRep > 0
+    ? repetitions * distancePerRep
+    : Number(base?.totalDistance || snapshotMeters || 0) || 0;
+  const expectedSplits = totalDistance && splitDistance ? Math.ceil(totalDistance / splitDistance) : 0;
+  return {
+    repetitions,
+    distancePerRep,
+    totalDistance,
+    expectedSplits,
+    source: base?.source || 'unknown',
+    detectedAutomatically: Boolean(base?.detectedAutomatically),
+    manuallyEdited: Boolean(base?.manuallyEdited),
+  };
+}
+
+function getActiveStructure(session = S.activeSession) {
+  const snapshot = session?.exerciseSnapshot || getTimingExercise();
+  if (!snapshot) return null;
+  const structure = session?.exerciseStructure || snapshot.structure || inferExerciseStructure(snapshot);
+  return normalizeExerciseStructure(structure, snapshot, Number(session?.splitDistance) || currentSplitDistance());
+}
+
+function structureSummaryText(structure) {
+  if (!structure || !structure.totalDistance) return 'Estrutura não definida';
+  const prefix = structure.repetitions && structure.distancePerRep
+    ? `${structure.repetitions} x ${structure.distancePerRep}m`
+    : `${structure.totalDistance}m`;
+  const suffix = structure.expectedSplits ? ` · ${structure.expectedSplits} parciais esperados` : '';
+  const source = structure.manuallyEdited ? 'manual' : structure.detectedAutomatically ? 'auto' : structure.source === 'meters' ? 'metros' : 'manual';
+  return `${prefix} · total ${structure.totalDistance}m${suffix} · ${source}`;
+}
+
+function splitMeta(splitNo, splitDistance, snapshot, structureOverride = null) {
+  const structure = normalizeExerciseStructure(structureOverride || snapshot?.structure, snapshot, splitDistance);
   const totalDistance = splitNo * splitDistance;
-  if (!pattern) return { label: `${totalDistance}m`, repetition: '', distanceMarker: totalDistance, totalDistance };
-  const repetition = Math.floor((totalDistance - 1) / pattern.repDistance) + 1;
-  const distanceMarker = ((totalDistance - 1) % pattern.repDistance) + 1;
-  const label = pattern.reps > 1 ? `Rep ${repetition} — ${distanceMarker}m` : `${distanceMarker}m`;
-  return { label, repetition, distanceMarker, totalDistance, repDistance: pattern.repDistance, reps: pattern.reps };
+
+  if (!structure.repetitions || !structure.distancePerRep) {
+    return {
+      label: `${totalDistance}m`,
+      repetition: '',
+      distanceMarker: totalDistance,
+      totalDistance,
+      repDistance: '',
+      reps: '',
+      expectedSplits: structure.expectedSplits || '',
+    };
+  }
+
+  const repetition = Math.floor((totalDistance - 1) / structure.distancePerRep) + 1;
+  const distanceMarker = ((totalDistance - 1) % structure.distancePerRep) + 1;
+  const beyond = structure.repetitions && repetition > structure.repetitions;
+  const label = beyond
+    ? `Extra — ${totalDistance}m`
+    : structure.repetitions > 1
+      ? `Rep ${repetition} — ${distanceMarker}m`
+      : `${distanceMarker}m`;
+
+  return {
+    label,
+    repetition: beyond ? 'Extra' : repetition,
+    distanceMarker,
+    totalDistance,
+    repDistance: structure.distancePerRep,
+    reps: structure.repetitions,
+    expectedSplits: structure.expectedSplits || '',
+  };
+}
+
+function targetForDistance(snapshot, totalDistance, structure = null) {
+  const targetMs = parseTargetTime(snapshot?.target);
+  const st = normalizeExerciseStructure(structure || snapshot?.structure, snapshot, currentSplitDistance());
+  if (!targetMs || !st.totalDistance || !totalDistance) return null;
+  const cappedDistance = Math.min(totalDistance, st.totalDistance);
+  return Math.round(targetMs * (cappedDistance / st.totalDistance));
+}
+
+function splitTargetForDistance(snapshot, splitDistance, structure = null, splitNo = 1) {
+  const st = normalizeExerciseStructure(structure || snapshot?.structure, snapshot, splitDistance);
+  const prevDistance = Math.min((splitNo - 1) * splitDistance, st.totalDistance || (splitNo - 1) * splitDistance);
+  const curDistance = Math.min(splitNo * splitDistance, st.totalDistance || splitNo * splitDistance);
+  const prevTarget = targetForDistance(snapshot, prevDistance, st) || 0;
+  const curTarget = targetForDistance(snapshot, curDistance, st);
+  return curTarget === null ? null : curTarget - prevTarget;
 }
 
 // ============================================================
@@ -906,7 +1012,11 @@ function setSplitDistance(value) {
     return;
   }
   S.liveSplitDistance = dist;
-  if (S.activeSession?.status === 'active') S.activeSession.splitDistance = dist;
+  if (S.activeSession?.status === 'active') {
+    S.activeSession.splitDistance = dist;
+    S.activeSession.exerciseStructure = normalizeExerciseStructure(S.activeSession.exerciseStructure, S.activeSession.exerciseSnapshot, dist);
+    S.activeSession.exerciseSnapshot.structure = S.activeSession.exerciseStructure;
+  }
   saveState();
   renderTab();
 }
@@ -920,13 +1030,15 @@ function setActiveAthlete(id) {
 
 function createLiveSession(snapshot) {
   const splitDistance = Number(S.liveSplitDistance) || defaultSplitDistance(snapshot.pool);
+  const exerciseStructure = normalizeExerciseStructure(snapshot.structure || inferExerciseStructure(snapshot), snapshot, splitDistance);
   return {
     id: uid('session'),
     status: 'active',
     date: new Date().toLocaleDateString('pt-PT'),
     createdAt: new Date().toISOString(),
     exerciseId: snapshot.id,
-    exerciseSnapshot: snapshot,
+    exerciseSnapshot: { ...snapshot, structure: exerciseStructure },
+    exerciseStructure,
     pool: snapshot.pool,
     splitDistance,
     running: false,
@@ -935,6 +1047,7 @@ function createLiveSession(snapshot) {
     splitsByAthlete: {},
     history: [],
     activeAthleteId: S.activeAthleteId || '',
+    zoneLogged: false,
   };
 }
 
@@ -1006,7 +1119,7 @@ function nextSplitInfoForAthlete(athleteId) {
   const session = S.activeSession;
   const snapshot = getTimingExercise();
   const list = session?.splitsByAthlete?.[athleteId] || [];
-  return splitMeta(list.length + 1, currentSplitDistance(), snapshot);
+  return splitMeta(list.length + 1, currentSplitDistance(), snapshot, session?.exerciseStructure || snapshot?.structure);
 }
 
 function takeLiveSplit() {
@@ -1027,22 +1140,26 @@ function takeLiveSplit() {
   const list = session.splitsByAthlete[aid];
   const cum = getLiveElapsed(session);
   const prevCum = list.length ? list[list.length - 1].cum : 0;
-  const meta = splitMeta(list.length + 1, session.splitDistance, session.exerciseSnapshot);
-  const targetMs = parseTargetTime(session.exerciseSnapshot?.target);
-  const totalMeters = parseMeters(session.exerciseSnapshot?.metros);
-  const targetDiffMs = targetMs && totalMeters && meta.totalDistance >= totalMeters ? cum - targetMs : null;
+  const splitNo = list.length + 1;
+  const meta = splitMeta(splitNo, session.splitDistance, session.exerciseSnapshot, session.exerciseStructure);
+  const targetExpectedMs = targetForDistance(session.exerciseSnapshot, meta.totalDistance, session.exerciseStructure);
+  const lapTargetMs = splitTargetForDistance(session.exerciseSnapshot, session.splitDistance, session.exerciseStructure, splitNo);
+  const targetDiffMs = targetExpectedMs === null ? null : cum - targetExpectedMs;
   const split = {
     id: uid('split'),
     athleteId: aid,
     athleteName: athlete.nome,
-    splitNo: list.length + 1,
+    splitNo,
     cum,
     lap: cum - prevCum,
     distanceMarker: meta.distanceMarker,
     totalDistance: meta.totalDistance,
     repetition: meta.repetition,
     repDistance: meta.repDistance,
+    expectedSplits: meta.expectedSplits,
     label: meta.label,
+    targetExpectedMs,
+    lapTargetMs,
     targetDiffMs,
     createdAt: new Date().toISOString(),
   };
@@ -1057,20 +1174,23 @@ function recomputeAthleteSplits(athleteId) {
   const session = S.activeSession;
   const list = session?.splitsByAthlete?.[athleteId];
   if (!Array.isArray(list)) return;
-  const targetMs = parseTargetTime(session.exerciseSnapshot?.target);
-  const totalMeters = parseMeters(session.exerciseSnapshot?.metros);
   list.sort((a, b) => a.cum - b.cum);
   list.forEach((s, idx) => {
-    const meta = splitMeta(idx + 1, session.splitDistance, session.exerciseSnapshot);
+    const splitNo = idx + 1;
+    const meta = splitMeta(splitNo, session.splitDistance, session.exerciseSnapshot, session.exerciseStructure);
     const prevCum = idx ? list[idx - 1].cum : 0;
-    s.splitNo = idx + 1;
+    const targetExpectedMs = targetForDistance(session.exerciseSnapshot, meta.totalDistance, session.exerciseStructure);
+    s.splitNo = splitNo;
     s.lap = s.cum - prevCum;
     s.distanceMarker = meta.distanceMarker;
     s.totalDistance = meta.totalDistance;
     s.repetition = meta.repetition;
     s.repDistance = meta.repDistance;
+    s.expectedSplits = meta.expectedSplits;
     s.label = meta.label;
-    s.targetDiffMs = targetMs && totalMeters && meta.totalDistance >= totalMeters ? s.cum - targetMs : null;
+    s.targetExpectedMs = targetExpectedMs;
+    s.lapTargetMs = splitTargetForDistance(session.exerciseSnapshot, session.splitDistance, session.exerciseStructure, splitNo);
+    s.targetDiffMs = targetExpectedMs === null ? null : s.cum - targetExpectedMs;
   });
 }
 
@@ -1137,6 +1257,7 @@ function finishLiveSession() {
       ciclo: ex.ciclo || '',
       pool: ex.pool || '',
       splitDistance: session.splitDistance,
+      exerciseStructure: session.exerciseStructure || ex.structure || null,
       targetTime: ex.target || '',
       splits: splits.map((s) => ({
         id: s.id,
@@ -1147,13 +1268,17 @@ function finishLiveSession() {
         repetition: s.repetition,
         distanceMarker: s.distanceMarker,
         totalDistance: s.totalDistance,
+        expectedSplits: s.expectedSplits || '',
+        targetExpectedMs: s.targetExpectedMs ?? null,
+        lapTargetMs: s.lapTargetMs ?? null,
         targetDiffMs: s.targetDiffMs,
       })),
     });
   });
+  const loggedZone = autoLogFinishedSessionZone(session);
   saveState();
   renderTab();
-  toast('Sessão terminada e resultados guardados.');
+  toast(loggedZone ? 'Sessão terminada, resultados guardados e zonas atualizadas.' : 'Sessão terminada e resultados guardados.');
 }
 
 function clearFinishedSession() {
@@ -1175,6 +1300,95 @@ function discardActiveSession() {
       { label: 'Descartar', cls: 'btn-danger', fn: () => { if (S.activeSession?.running) releaseWakeLock(); S.activeSession = null; saveState(); closeModal(); renderTab(); } },
       { label: 'Cancelar', cls: 'btn-secondary', fn: closeModal },
     ]);
+}
+
+
+function canEditActiveStructure() {
+  return !(S.activeSession?.status === 'active' && hasSplits(S.activeSession));
+}
+
+function showExerciseStructureModal() {
+  const session = ensureLiveSession();
+  if (!session) return;
+  const locked = hasSplits(session);
+  const st = getActiveStructure(session);
+  const disabled = locked ? 'disabled' : '';
+  showModal('Estrutura do exercício',
+    `<div style="font-size:13px;color:#6b85a8;line-height:1.5;margin-bottom:10px;">
+      A app tenta detetar formatos simples como <strong>8 x 100</strong>. Se o plano for mais complexo, defina manualmente. Depois do primeiro parcial, esta estrutura fica bloqueada.
+    </div>
+    <div class="info-bar">Atual: <strong>${esc(structureSummaryText(st))}</strong></div>
+    <div class="form-row">
+      <label style="flex:1;"><span class="form-label">Repetições</span><input class="inp" id="structReps" type="number" min="1" step="1" value="${st?.repetitions || ''}" ${disabled}></label>
+      <label style="flex:1;"><span class="form-label">Distância por repetição</span><input class="inp" id="structRepDistance" type="number" min="1" step="1" value="${st?.distancePerRep || ''}" ${disabled}></label>
+    </div>
+    <div class="form-row">
+      <label style="flex:1;"><span class="form-label">Parcial</span><select class="sel" id="structSplitDistance" ${disabled}>
+        <option value="25" ${currentSplitDistance() === 25 ? 'selected' : ''}>25m</option>
+        <option value="50" ${currentSplitDistance() === 50 ? 'selected' : ''}>50m</option>
+      </select></label>
+      <label style="flex:1;"><span class="form-label">Total calculado</span><input class="inp" value="${st?.totalDistance || ''}m" disabled></label>
+    </div>
+    ${locked ? '<div class="warn-box">A estrutura está bloqueada porque já existem parciais. Remova os parciais ou descarte a sessão para alterar.</div>' : ''}`,
+    locked ? [
+      { label: 'Fechar', cls: 'btn-secondary', fn: closeModal },
+    ] : [
+      { label: 'Guardar estrutura', cls: 'btn-primary', fn: saveExerciseStructureFromModal },
+      { label: 'Cancelar', cls: 'btn-secondary', fn: closeModal },
+    ]);
+}
+
+function saveExerciseStructureFromModal() {
+  const session = ensureLiveSession();
+  if (!session) return;
+  if (hasSplits(session)) {
+    toast('A estrutura está bloqueada após o primeiro parcial.');
+    closeModal();
+    renderTab();
+    return;
+  }
+  const repetitions = parseMeters($('structReps')?.value);
+  const distancePerRep = parseMeters($('structRepDistance')?.value);
+  const splitDistance = Number($('structSplitDistance')?.value) || currentSplitDistance();
+  if (!repetitions || !distancePerRep) {
+    toast('Defina repetições e distância por repetição.');
+    return;
+  }
+  if (![25, 50].includes(splitDistance)) {
+    toast('Escolha parcial de 25m ou 50m.');
+    return;
+  }
+  S.liveSplitDistance = splitDistance;
+  session.splitDistance = splitDistance;
+  session.exerciseStructure = normalizeExerciseStructure({
+    repetitions,
+    distancePerRep,
+    totalDistance: repetitions * distancePerRep,
+    source: 'manual',
+    detectedAutomatically: false,
+    manuallyEdited: true,
+  }, session.exerciseSnapshot, splitDistance);
+  session.exerciseSnapshot.structure = session.exerciseStructure;
+  saveState();
+  closeModal();
+  renderTab();
+  toast('Estrutura guardada.');
+}
+
+function autoLogFinishedSessionZone(session) {
+  if (!session || session.zoneLogged) return false;
+  const ex = session.exerciseSnapshot || {};
+  const zona = ex.zona || '';
+  const metros = parseMeters(ex.metros);
+  if (!zona || !ZONAS.includes(zona) || !metros) {
+    session.zoneLogged = true;
+    return false;
+  }
+  const key = `${ex.dayIdx}_${ex.sess}`;
+  if (!S.zoneLog[key]) S.zoneLog[key] = zoneTotals();
+  S.zoneLog[key][zona] = (S.zoneLog[key][zona] || 0) + metros;
+  session.zoneLogged = true;
+  return true;
 }
 
 function renderAthleteChips() {
@@ -1212,11 +1426,12 @@ function renderLiveSplits() {
     const name = athlete?.nome || session.splitsByAthlete[aid][0]?.athleteName || 'Atleta';
     return `<div class="live-split-group">
       <div class="live-split-title">${esc(name)} <span>${session.splitsByAthlete[aid].length} parcial${session.splitsByAthlete[aid].length !== 1 ? 'is' : ''}</span></div>
+      <div class="live-split-head"><span>Parcial</span><span>Acum.</span><span>Volta</span><span>vs alvo</span><span></span></div>
       <div class="live-split-table">${session.splitsByAthlete[aid].map((s) => `<div class="live-split-row">
         <span>${esc(s.label || `#${s.splitNo}`)}</span>
         <strong>${fmtTime(s.cum)}</strong>
         <span>${fmtTime(s.lap)}</span>
-        ${s.targetDiffMs !== null && s.targetDiffMs !== undefined ? `<span class="${s.targetDiffMs > 0 ? 'lap-slow' : 'lap-fast'}">${s.targetDiffMs >= 0 ? '+' : ''}${fmtTime(Math.abs(s.targetDiffMs))}</span>` : '<span></span>'}
+        ${s.targetDiffMs !== null && s.targetDiffMs !== undefined ? `<span class="${s.targetDiffMs > 0 ? 'lap-slow' : 'lap-fast'}">${s.targetDiffMs >= 0 ? '+' : ''}${fmtTime(Math.abs(s.targetDiffMs))}</span>` : '<span>—</span>'}
         <button onclick="deleteLiveSplit('${esc(aid)}','${esc(s.id)}')">✕</button>
       </div>`).join('')}</div>
     </div>`;
@@ -1242,6 +1457,7 @@ function renderLiveTimingPanel() {
       <div class="live-ex-title">${esc(ex.blockName)} — ${esc(ex.zona || '—')}</div>
       <div class="live-ex-desc">${esc(ex.desc || '—')}</div>
       <div class="live-ex-meta">${esc(ex.day)} · ${esc(ex.sessionLabel)} · ${esc(ex.pool || 'Piscina?')} · ${ex.metros ? `${ex.metros}m` : 'metros?'}${ex.ciclo ? ` · ${esc(ex.ciclo)}` : ''}${ex.target ? ` · Alvo total ${esc(ex.target)}` : ''}</div>
+      <div class="structure-pill"><span>Estrutura: ${esc(structureSummaryText(getActiveStructure(session)))}</span><button class="btn btn-secondary btn-sm" onclick="showExerciseStructureModal()" ${session?.status === 'finished' ? 'disabled' : ''}>Editar</button></div>
     </div>
 
     <div class="card">
@@ -1258,7 +1474,7 @@ function renderLiveTimingPanel() {
       <div class="sw-info">${totalSplitCount(session)} parcial${totalSplitCount(session) !== 1 ? 'is' : ''}${finished ? ' · sessão terminada' : ''}</div>
       <div class="sw-controls live-controls">
         <button class="sw-btn start" onclick="toggleLiveSW()" ${finished ? 'disabled' : ''}>${session?.running ? 'Parar' : session?.elapsed ? 'Retomar' : 'Iniciar'}</button>
-        <button class="sw-btn split" onclick="takeLiveSplit()" ${!canSplit || finished ? 'disabled' : ''}>${activeAthlete ? `Split ${esc(activeAthlete.nome)}` : 'Split'}</button>
+        <button class="sw-btn split" onclick="takeLiveSplit()" ${!canSplit || finished ? 'disabled' : ''}>${activeAthlete ? `Split ${esc(activeAthlete.nome)}${next ? ` · ${esc(next.label)}` : ''}` : 'Split'}</button>
         <button class="sw-btn split" onclick="undoLastLiveSplit()" ${!session?.history?.length || finished ? 'disabled' : ''}>Undo</button>
       </div>
       <div class="finish-row">
@@ -1310,6 +1526,7 @@ function renderZonas() {
 
   let html = dayTabsHTML();
   html += selectedExerciseBannerHTML();
+  html += `<div class="info-bar">Realizado inclui exercícios terminados no Live e metros registados manualmente. A conclusão de um exercício soma os metros da linha uma única vez, não por atleta.</div>`;
   html += `<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px;">
     <div class="zone-metric"><div class="lbl">Planeado</div><div class="val">${totalP}m</div></div>
     <div class="zone-metric"><div class="lbl">Realizado</div><div class="val">${totalL}m</div></div>
@@ -1461,7 +1678,7 @@ function renderResultados() {
     html += data.slice().reverse().map((r) => {
       const avg = r.splits.reduce((a, s) => a + s.lap, 0) / (r.splits.length || 1);
       return `<div class="result-card"><div class="result-header">
-        <div><div class="result-name">${esc(r.athlete)}</div><div class="result-meta">${esc(r.dia)} · ${r.sessao === 'manha' ? 'Manhã' : 'Tarde'} · ${esc(r.date)} · ${esc(r.bloco)}${r.exerciseDesc ? ` · ${esc(r.exerciseDesc)}` : ''}${r.zone ? ` · ${esc(r.zone)}` : ''}${r.targetTime ? ` · Alvo total ${esc(r.targetTime)}` : ''}</div></div>
+        <div><div class="result-name">${esc(r.athlete)}</div><div class="result-meta">${esc(r.dia)} · ${r.sessao === 'manha' ? 'Manhã' : 'Tarde'} · ${esc(r.date)} · ${esc(r.bloco)}${r.exerciseDesc ? ` · ${esc(r.exerciseDesc)}` : ''}${r.zone ? ` · ${esc(r.zone)}` : ''}${r.exerciseStructure ? ` · ${esc(structureSummaryText(r.exerciseStructure))}` : ''}${r.targetTime ? ` · Alvo total ${esc(r.targetTime)}` : ''}</div></div>
         <button class="btn btn-danger btn-sm" onclick="deleteResult('${esc(r.id)}')">✕</button>
       </div><div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums;">
         <thead><tr style="color:#4a6490;"><th style="text-align:left;padding:4px 6px;">Parcial</th><th style="text-align:right;padding:4px 6px;">Acum.</th><th style="text-align:right;padding:4px 6px;">Volta</th><th style="text-align:right;padding:4px 6px;">vs Média</th><th style="text-align:right;padding:4px 6px;">vs Alvo</th></tr></thead>
@@ -1485,7 +1702,7 @@ function deleteResult(id) {
 function exportCSV() {
   if (!S.results.length) { toast('Sem resultados para exportar.'); return; }
   const rows = [[
-    'SessionID', 'Data', 'Dia', 'Sessão', 'Atleta', 'Bloco', 'Exercício', 'Zona', 'Metros', 'Piscina', 'SplitDistance', 'AlvoTotal', 'Parcial', 'Repetição', 'DistânciaParcial', 'DistânciaTotal', 'Acumulado', 'Volta', 'DeltaAlvoFinal'
+    'SessionID', 'Data', 'Dia', 'Sessão', 'Atleta', 'Bloco', 'Exercício', 'Zona', 'Metros', 'Piscina', 'SplitDistance', 'AlvoTotal', 'Estrutura', 'Parcial', 'Repetição', 'DistânciaParcial', 'DistânciaTotal', 'Acumulado', 'Volta', 'AlvoAcumulado', 'DeltaAlvoAcumulado'
   ]];
   S.results.forEach((r) => r.splits.forEach((s, i) => rows.push([
     r.sessionId || '',
@@ -1500,12 +1717,14 @@ function exportCSV() {
     r.pool || '',
     r.splitDistance || '',
     r.targetTime || '',
+    r.exerciseStructure ? structureSummaryText(r.exerciseStructure) : '',
     s.label || i + 1,
     s.repetition || '',
     s.distanceMarker || '',
     s.totalDistance || '',
     fmtTime(s.cum),
     fmtTime(s.lap),
+    s.targetExpectedMs === null || s.targetExpectedMs === undefined ? '' : fmtTime(s.targetExpectedMs),
     s.targetDiffMs === null || s.targetDiffMs === undefined ? '' : `${s.targetDiffMs >= 0 ? '+' : '-'}${fmtTime(Math.abs(s.targetDiffMs))}`,
   ])));
   const csv = rows.map((r) => r.map((v) => JSON.stringify(String(v))).join(',')).join('\n');
