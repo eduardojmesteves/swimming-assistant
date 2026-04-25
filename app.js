@@ -6,8 +6,8 @@
 const ZONAS = ['TT', 'A1', 'A2', 'A3', 'M.AER', 'LAN', 'M.ANA', 'VEL', 'PML', 'TL'];
 const DIAS = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo'];
 const DIAS_SHORT = ['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb', 'Dom'];
-const STORE_KEY = 'swim_coach_v4_live';
-const OLD_STORE_KEYS = ['swim_coach_v3', 'swim_coach_v2', 'swimcoach_v2'];
+const STORE_KEY = 'swim_coach_v6_phase4';
+const OLD_STORE_KEYS = ['swim_coach_v5_phase3', 'swim_coach_v4_live', 'swim_coach_v3', 'swim_coach_v2', 'swimcoach_v2'];
 
 const COL = {
   day: 0,
@@ -53,6 +53,7 @@ function defaultState() {
     athletes: [],
     results: [],
     zoneLog: {},
+    weekLabel: '',
     selectedExerciseId: '',
     selectedExercise: null,
     activeAthleteId: '',
@@ -133,6 +134,24 @@ function parseTargetTime(value) {
   return 0;
 }
 
+function parseTimeInputToMs(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const looksLikeTime = /^(\d+\s*[:']\s*\d{1,2}(?:\s*(?:[".]|,)?\s*\d{1,3})?|\d+(?:[.,]\d+)?\s*s?)$/i.test(raw);
+  if (!looksLikeTime) return null;
+  const ms = parseTargetTime(raw);
+  return Number.isFinite(ms) && ms >= 0 ? Math.round(ms) : null;
+}
+
+function formatEditableTime(ms) {
+  return fmtTime(ms || 0);
+}
+
+function describeSplitDelta(ms) {
+  if (ms === null || ms === undefined || !Number.isFinite(ms)) return '—';
+  return `${ms >= 0 ? '+' : ''}${fmtTime(Math.abs(ms))}`;
+}
+
 function initials(name) {
   return String(name || '')
     .trim()
@@ -177,6 +196,7 @@ function loadState() {
         zoneLog: d.zoneLog || {},
         weekPlan: d.weekPlan || {},
         zonePlan: d.zonePlan || {},
+        weekLabel: d.weekLabel || '',
         selectedExerciseId: d.selectedExerciseId || '',
         selectedExercise: d.selectedExercise || null,
         activeAthleteId: d.activeAthleteId || d.cronoAthleteId || '',
@@ -198,6 +218,7 @@ function saveState() {
       zoneLog: S.zoneLog,
       weekPlan: S.weekPlan,
       zonePlan: S.zonePlan,
+      weekLabel: S.weekLabel,
       selectedExerciseId: S.selectedExerciseId,
       selectedExercise: S.selectedExercise,
       activeAthleteId: S.activeAthleteId,
@@ -322,7 +343,7 @@ function buildExerciseSnapshot(dayIdx, sess, idx) {
   const entry = getExerciseEntries(dayIdx, sess).find((e) => e.idx === Number(idx));
   if (!entry) return null;
   const ex = entry.ex;
-  return {
+  const snap = {
     id: entry.id,
     dayIdx,
     sess,
@@ -338,6 +359,8 @@ function buildExerciseSnapshot(dayIdx, sess, idx) {
     target: ex.target || '',
     pool: getPool(dayIdx),
   };
+  snap.structure = inferExerciseStructure(snap);
+  return snap;
 }
 
 function getSelectedExercise() {
@@ -409,28 +432,132 @@ function getTimingExercise() {
   return getSelectedExercise();
 }
 
-function exercisePattern(snapshot) {
+function inferExerciseStructure(snapshot) {
   if (!snapshot) return null;
-  const txt = `${snapshot.desc || ''} ${snapshot.metros || ''}`;
-  const m = txt.match(/(\d{1,2})\s*(?:x|×)\s*(\d{2,4})/i);
-  if (m) {
-    const reps = Number(m[1]);
-    const repDistance = Number(m[2]);
-    if (reps > 0 && repDistance > 0) return { reps, repDistance, source: 'auto' };
+  const txt = `${snapshot.desc || ''}`;
+  const simple = txt.match(/(?:^|\s)(\d{1,3})\s*(?:x|×)\s*(\d{1,4})(?=\D|$)/i);
+  if (simple) {
+    const repetitions = Number(simple[1]);
+    const distancePerRep = Number(simple[2]);
+    if (repetitions > 0 && distancePerRep > 0) {
+      return {
+        repetitions,
+        distancePerRep,
+        totalDistance: repetitions * distancePerRep,
+        source: 'auto',
+        detectedAutomatically: true,
+      };
+    }
   }
+
   const meters = parseMeters(snapshot.metros);
-  if (meters > 0) return { reps: 1, repDistance: meters, source: 'meters' };
-  return null;
+  if (meters > 0) {
+    return {
+      repetitions: 1,
+      distancePerRep: meters,
+      totalDistance: meters,
+      source: 'meters',
+      detectedAutomatically: false,
+    };
+  }
+
+  return {
+    repetitions: 0,
+    distancePerRep: 0,
+    totalDistance: 0,
+    source: 'unknown',
+    detectedAutomatically: false,
+  };
 }
 
-function splitMeta(splitNo, splitDistance, snapshot) {
-  const pattern = exercisePattern(snapshot);
+function normalizeExerciseStructure(structure, snapshot, splitDistance = currentSplitDistance()) {
+  const base = structure || inferExerciseStructure(snapshot);
+  const repetitions = Number(base?.repetitions ?? base?.reps ?? 0) || 0;
+  const distancePerRep = Number(base?.distancePerRep ?? base?.repDistance ?? 0) || 0;
+  const snapshotMeters = parseMeters(snapshot?.metros);
+  const totalDistance = repetitions > 0 && distancePerRep > 0
+    ? repetitions * distancePerRep
+    : Number(base?.totalDistance || snapshotMeters || 0) || 0;
+  const expectedSplits = totalDistance && splitDistance ? Math.ceil(totalDistance / splitDistance) : 0;
+  return {
+    repetitions,
+    distancePerRep,
+    totalDistance,
+    expectedSplits,
+    source: base?.source || 'unknown',
+    detectedAutomatically: Boolean(base?.detectedAutomatically),
+    manuallyEdited: Boolean(base?.manuallyEdited),
+  };
+}
+
+function getActiveStructure(session = S.activeSession) {
+  const snapshot = session?.exerciseSnapshot || getTimingExercise();
+  if (!snapshot) return null;
+  const structure = session?.exerciseStructure || snapshot.structure || inferExerciseStructure(snapshot);
+  return normalizeExerciseStructure(structure, snapshot, Number(session?.splitDistance) || currentSplitDistance());
+}
+
+function structureSummaryText(structure) {
+  if (!structure || !structure.totalDistance) return 'Estrutura não definida';
+  const prefix = structure.repetitions && structure.distancePerRep
+    ? `${structure.repetitions} x ${structure.distancePerRep}m`
+    : `${structure.totalDistance}m`;
+  const suffix = structure.expectedSplits ? ` · ${structure.expectedSplits} parciais esperados` : '';
+  const source = structure.manuallyEdited ? 'manual' : structure.detectedAutomatically ? 'auto' : structure.source === 'meters' ? 'metros' : 'manual';
+  return `${prefix} · total ${structure.totalDistance}m${suffix} · ${source}`;
+}
+
+function splitMeta(splitNo, splitDistance, snapshot, structureOverride = null) {
+  const structure = normalizeExerciseStructure(structureOverride || snapshot?.structure, snapshot, splitDistance);
   const totalDistance = splitNo * splitDistance;
-  if (!pattern) return { label: `${totalDistance}m`, repetition: '', distanceMarker: totalDistance, totalDistance };
-  const repetition = Math.floor((totalDistance - 1) / pattern.repDistance) + 1;
-  const distanceMarker = ((totalDistance - 1) % pattern.repDistance) + 1;
-  const label = pattern.reps > 1 ? `Rep ${repetition} — ${distanceMarker}m` : `${distanceMarker}m`;
-  return { label, repetition, distanceMarker, totalDistance, repDistance: pattern.repDistance, reps: pattern.reps };
+
+  if (!structure.repetitions || !structure.distancePerRep) {
+    return {
+      label: `${totalDistance}m`,
+      repetition: '',
+      distanceMarker: totalDistance,
+      totalDistance,
+      repDistance: '',
+      reps: '',
+      expectedSplits: structure.expectedSplits || '',
+    };
+  }
+
+  const repetition = Math.floor((totalDistance - 1) / structure.distancePerRep) + 1;
+  const distanceMarker = ((totalDistance - 1) % structure.distancePerRep) + 1;
+  const beyond = structure.repetitions && repetition > structure.repetitions;
+  const label = beyond
+    ? `Extra — ${totalDistance}m`
+    : structure.repetitions > 1
+      ? `Rep ${repetition} — ${distanceMarker}m`
+      : `${distanceMarker}m`;
+
+  return {
+    label,
+    repetition: beyond ? 'Extra' : repetition,
+    distanceMarker,
+    totalDistance,
+    repDistance: structure.distancePerRep,
+    reps: structure.repetitions,
+    expectedSplits: structure.expectedSplits || '',
+  };
+}
+
+function targetForDistance(snapshot, totalDistance, structure = null) {
+  const targetMs = parseTargetTime(snapshot?.target);
+  const st = normalizeExerciseStructure(structure || snapshot?.structure, snapshot, currentSplitDistance());
+  if (!targetMs || !st.totalDistance || !totalDistance) return null;
+  const cappedDistance = Math.min(totalDistance, st.totalDistance);
+  return Math.round(targetMs * (cappedDistance / st.totalDistance));
+}
+
+function splitTargetForDistance(snapshot, splitDistance, structure = null, splitNo = 1) {
+  const st = normalizeExerciseStructure(structure || snapshot?.structure, snapshot, splitDistance);
+  const prevDistance = Math.min((splitNo - 1) * splitDistance, st.totalDistance || (splitNo - 1) * splitDistance);
+  const curDistance = Math.min(splitNo * splitDistance, st.totalDistance || splitNo * splitDistance);
+  const prevTarget = targetForDistance(snapshot, prevDistance, st) || 0;
+  const curTarget = targetForDistance(snapshot, curDistance, st);
+  return curTarget === null ? null : curTarget - prevTarget;
 }
 
 // ============================================================
@@ -495,7 +622,10 @@ function renderPlano() {
       <span style="font-size:15px;font-weight:700;color:#a8c0e0;">${esc(DIAS[S.dayIdx])} — ${S.sessao === 'manha' ? 'Manhã' : 'Tarde'}</span>
       ${piscina ? `<span class="tag" style="margin-left:6px;">${esc(piscina)}</span>` : ''}
     </div>
-    <div style="font-size:12px;color:#4a6490;white-space:nowrap;">Total: <strong style="color:#4d9fff">${totalP}m</strong></div>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <div style="font-size:12px;color:#4a6490;white-space:nowrap;">Total: <strong style="color:#4d9fff">${totalP}m</strong></div>
+      <button class="btn btn-secondary btn-sm" onclick="showPlanManager()">Gerir plano</button>
+    </div>
   </div>`;
 
   html += `<div class="card" style="margin-bottom:10px;">
@@ -513,6 +643,148 @@ function renderPlano() {
 }
 
 // ============================================================
+// PLAN MANAGEMENT
+// ============================================================
+function planStats() {
+  const days = Object.keys(S.weekPlan || {}).length;
+  let exercises = 0;
+  let meters = 0;
+  Object.values(S.weekPlan || {}).forEach((day) => {
+    ['manha', 'tarde'].forEach((sess) => {
+      (day?.[sess] || []).forEach((b) => {
+        if (!b.isHeader) {
+          exercises += 1;
+          meters += parseMeters(b.metros);
+        }
+      });
+    });
+  });
+  return { days, exercises, meters };
+}
+
+function hasBlockingActiveSession() {
+  return S.activeSession?.status === 'active' && (S.activeSession.running || hasSplits(S.activeSession));
+}
+
+function triggerPlanImport() {
+  if (hasBlockingActiveSession()) {
+    toast('Termine ou descarte a sessão ativa antes de substituir o plano.');
+    return;
+  }
+  closeModal();
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.xlsx,.xls';
+  input.style.display = 'none';
+  input.addEventListener('change', loadXlsx);
+  document.body.appendChild(input);
+  input.click();
+  setTimeout(() => input.remove(), 30000);
+}
+
+function showPlanManager() {
+  const st = planStats();
+  const hasPlan = st.days > 0;
+  const activeWarning = hasBlockingActiveSession()
+    ? '<div class="info-bar" style="margin-top:10px;color:#e74c3c;border-color:#4a1818;background:#2a0808;">⚠️ Existe uma sessão Live ativa com tempos. Termine ou descarte a sessão antes de limpar/substituir o plano.</div>'
+    : '';
+
+  showModal('Gerir plano',
+    `<div class="plan-summary">
+      <div><span>Plano atual</span><strong>${hasPlan ? esc(S.weekLabel || 'Plano carregado') : 'Nenhum plano carregado'}</strong></div>
+      <div><span>Dias</span><strong>${st.days}</strong></div>
+      <div><span>Exercícios</span><strong>${st.exercises}</strong></div>
+      <div><span>Metros</span><strong>${st.meters}</strong></div>
+    </div>
+    <div style="font-size:12px;color:#6b85a8;line-height:1.5;margin-top:10px;">
+      <strong>Limpar plano atual</strong> remove o plano, zonas planeadas/registadas e exercício selecionado. Mantém atletas e resultados.
+    </div>
+    ${activeWarning}`,
+    [
+      { label: 'Carregar/substituir plano', cls: 'btn-primary', fn: triggerPlanImport },
+      { label: 'Limpar plano atual', cls: 'btn-secondary', fn: showClearPlanConfirm },
+      { label: 'Apagar todos os dados', cls: 'btn-danger', fn: showClearAllConfirm },
+      { label: 'Cancelar', cls: 'btn-secondary', fn: closeModal },
+    ]);
+}
+
+function showClearPlanConfirm() {
+  if (hasBlockingActiveSession()) {
+    toast('Termine ou descarte a sessão ativa antes de limpar o plano.');
+    return;
+  }
+  const st = planStats();
+  if (!st.days) {
+    toast('Não existe plano para limpar.');
+    closeModal();
+    return;
+  }
+  showModal('Limpar plano atual',
+    `<div style="font-size:13px;color:#6b85a8;line-height:1.5;">
+      Isto remove apenas os dados ligados ao plano atual: plano semanal, zonas planeadas/registadas, exercício selecionado e sessão Live ativa sem tempos.
+      <br><br><strong style="color:#a8c0e0;">Atletas e resultados guardados serão mantidos.</strong>
+    </div>`,
+    [
+      { label: 'Limpar plano', cls: 'btn-danger', fn: clearCurrentPlan },
+      { label: 'Cancelar', cls: 'btn-secondary', fn: showPlanManager },
+    ]);
+}
+
+function clearCurrentPlan() {
+  if (hasBlockingActiveSession()) {
+    toast('Termine ou descarte a sessão ativa antes de limpar o plano.');
+    return;
+  }
+  S.weekPlan = {};
+  S.zonePlan = {};
+  S.zoneLog = {};
+  S.weekLabel = '';
+  S.selectedExerciseId = '';
+  S.selectedExercise = null;
+  S.activeSession = null;
+  S.liveSplitDistance = 25;
+  saveState();
+  closeModal();
+  renderTab();
+  toast('Plano atual limpo. Atletas e resultados foram mantidos.');
+}
+
+function showClearAllConfirm() {
+  showModal('Apagar todos os dados',
+    `<div style="font-size:13px;color:#6b85a8;line-height:1.5;">
+      Isto remove <strong style="color:#e74c3c;">planos, atletas, resultados, zonas e sessões</strong>. Esta ação não pode ser anulada.
+      <br><br>Escreva <strong style="color:#a8c0e0;">APAGAR</strong> para confirmar.
+    </div>
+    <input class="inp" id="wipeConfirm" autocomplete="off" placeholder="Escreva APAGAR" style="margin-top:12px;">`,
+    [
+      { label: 'Apagar tudo', cls: 'btn-danger', fn: clearAllData },
+      { label: 'Cancelar', cls: 'btn-secondary', fn: showPlanManager },
+    ]);
+}
+
+function clearAllData() {
+  const txt = $('wipeConfirm')?.value?.trim().toUpperCase();
+  if (txt !== 'APAGAR') {
+    toast('Confirmação incorreta. Escreva APAGAR.');
+    return;
+  }
+  if (S.activeSession?.running) {
+    clearInterval(S.activeSession.iv);
+    releaseWakeLock();
+  }
+  S = defaultState();
+  try {
+    localStorage.removeItem(STORE_KEY);
+    OLD_STORE_KEYS.forEach((key) => localStorage.removeItem(key));
+  } catch (_) {}
+  saveState();
+  closeModal();
+  syncSessionButtons();
+  renderTab();
+  toast('Todos os dados foram apagados.');
+}
+
+// ============================================================
 // XLSX PARSER
 // ============================================================
 function loadXlsx(e) {
@@ -527,6 +799,7 @@ function loadXlsx(e) {
       const ws = wb.Sheets[wb.SheetNames[0]];
       const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: true });
       const parsed = parseWeekRows(rows);
+      parsed.filename = file.name;
       showLoadModal(parsed, file.name);
     } catch (err) {
       console.error(err);
@@ -669,7 +942,9 @@ function applyPlan(parsed, merge) {
     S.selectedExerciseId = '';
     S.selectedExercise = null;
     S.activeSession = null;
+    S.weekLabel = String(parsed.filename || '').replace(/\.[^.]+$/, '') || 'Plano carregado';
   }
+  if (merge && parsed.filename && !S.weekLabel) S.weekLabel = String(parsed.filename).replace(/\.[^.]+$/, '');
   saveState();
   closeModal();
   renderTab();
@@ -755,7 +1030,11 @@ function setSplitDistance(value) {
     return;
   }
   S.liveSplitDistance = dist;
-  if (S.activeSession?.status === 'active') S.activeSession.splitDistance = dist;
+  if (S.activeSession?.status === 'active') {
+    S.activeSession.splitDistance = dist;
+    S.activeSession.exerciseStructure = normalizeExerciseStructure(S.activeSession.exerciseStructure, S.activeSession.exerciseSnapshot, dist);
+    S.activeSession.exerciseSnapshot.structure = S.activeSession.exerciseStructure;
+  }
   saveState();
   renderTab();
 }
@@ -769,13 +1048,15 @@ function setActiveAthlete(id) {
 
 function createLiveSession(snapshot) {
   const splitDistance = Number(S.liveSplitDistance) || defaultSplitDistance(snapshot.pool);
+  const exerciseStructure = normalizeExerciseStructure(snapshot.structure || inferExerciseStructure(snapshot), snapshot, splitDistance);
   return {
     id: uid('session'),
     status: 'active',
     date: new Date().toLocaleDateString('pt-PT'),
     createdAt: new Date().toISOString(),
     exerciseId: snapshot.id,
-    exerciseSnapshot: snapshot,
+    exerciseSnapshot: { ...snapshot, structure: exerciseStructure },
+    exerciseStructure,
     pool: snapshot.pool,
     splitDistance,
     running: false,
@@ -784,6 +1065,7 @@ function createLiveSession(snapshot) {
     splitsByAthlete: {},
     history: [],
     activeAthleteId: S.activeAthleteId || '',
+    zoneLogged: false,
   };
 }
 
@@ -855,7 +1137,7 @@ function nextSplitInfoForAthlete(athleteId) {
   const session = S.activeSession;
   const snapshot = getTimingExercise();
   const list = session?.splitsByAthlete?.[athleteId] || [];
-  return splitMeta(list.length + 1, currentSplitDistance(), snapshot);
+  return splitMeta(list.length + 1, currentSplitDistance(), snapshot, session?.exerciseStructure || snapshot?.structure);
 }
 
 function takeLiveSplit() {
@@ -876,22 +1158,26 @@ function takeLiveSplit() {
   const list = session.splitsByAthlete[aid];
   const cum = getLiveElapsed(session);
   const prevCum = list.length ? list[list.length - 1].cum : 0;
-  const meta = splitMeta(list.length + 1, session.splitDistance, session.exerciseSnapshot);
-  const targetMs = parseTargetTime(session.exerciseSnapshot?.target);
-  const totalMeters = parseMeters(session.exerciseSnapshot?.metros);
-  const targetDiffMs = targetMs && totalMeters && meta.totalDistance >= totalMeters ? cum - targetMs : null;
+  const splitNo = list.length + 1;
+  const meta = splitMeta(splitNo, session.splitDistance, session.exerciseSnapshot, session.exerciseStructure);
+  const targetExpectedMs = targetForDistance(session.exerciseSnapshot, meta.totalDistance, session.exerciseStructure);
+  const lapTargetMs = splitTargetForDistance(session.exerciseSnapshot, session.splitDistance, session.exerciseStructure, splitNo);
+  const targetDiffMs = targetExpectedMs === null ? null : cum - targetExpectedMs;
   const split = {
     id: uid('split'),
     athleteId: aid,
     athleteName: athlete.nome,
-    splitNo: list.length + 1,
+    splitNo,
     cum,
     lap: cum - prevCum,
     distanceMarker: meta.distanceMarker,
     totalDistance: meta.totalDistance,
     repetition: meta.repetition,
     repDistance: meta.repDistance,
+    expectedSplits: meta.expectedSplits,
     label: meta.label,
+    targetExpectedMs,
+    lapTargetMs,
     targetDiffMs,
     createdAt: new Date().toISOString(),
   };
@@ -906,20 +1192,23 @@ function recomputeAthleteSplits(athleteId) {
   const session = S.activeSession;
   const list = session?.splitsByAthlete?.[athleteId];
   if (!Array.isArray(list)) return;
-  const targetMs = parseTargetTime(session.exerciseSnapshot?.target);
-  const totalMeters = parseMeters(session.exerciseSnapshot?.metros);
   list.sort((a, b) => a.cum - b.cum);
   list.forEach((s, idx) => {
-    const meta = splitMeta(idx + 1, session.splitDistance, session.exerciseSnapshot);
+    const splitNo = idx + 1;
+    const meta = splitMeta(splitNo, session.splitDistance, session.exerciseSnapshot, session.exerciseStructure);
     const prevCum = idx ? list[idx - 1].cum : 0;
-    s.splitNo = idx + 1;
+    const targetExpectedMs = targetForDistance(session.exerciseSnapshot, meta.totalDistance, session.exerciseStructure);
+    s.splitNo = splitNo;
     s.lap = s.cum - prevCum;
     s.distanceMarker = meta.distanceMarker;
     s.totalDistance = meta.totalDistance;
     s.repetition = meta.repetition;
     s.repDistance = meta.repDistance;
+    s.expectedSplits = meta.expectedSplits;
     s.label = meta.label;
-    s.targetDiffMs = targetMs && totalMeters && meta.totalDistance >= totalMeters ? s.cum - targetMs : null;
+    s.targetExpectedMs = targetExpectedMs;
+    s.lapTargetMs = splitTargetForDistance(session.exerciseSnapshot, session.splitDistance, session.exerciseStructure, splitNo);
+    s.targetDiffMs = targetExpectedMs === null ? null : s.cum - targetExpectedMs;
   });
 }
 
@@ -947,6 +1236,109 @@ function deleteLiveSplit(athleteId, splitId) {
   saveState();
   renderTab();
   toast('Parcial removido.');
+}
+
+function findLiveSplit(athleteId, splitId) {
+  const session = S.activeSession;
+  const list = session?.splitsByAthlete?.[athleteId] || [];
+  return list.find((sp) => String(sp.id) === String(splitId)) || null;
+}
+
+function showEditLiveSplitModal(athleteId, splitId) {
+  const split = findLiveSplit(athleteId, splitId);
+  if (!split) {
+    toast('Parcial não encontrado.');
+    return;
+  }
+  showModal('Editar tempo do parcial',
+    `<div style="font-size:13px;color:#6b85a8;line-height:1.5;margin-bottom:10px;">
+      Corrija o tempo acumulado deste parcial. Use formatos como <strong>01:12.34</strong> ou <strong>72.34</strong>.
+    </div>
+    <div class="info-bar">Atual: <strong>${fmtTime(split.cum)}</strong> · ${esc(split.label || ('#' + split.splitNo))}</div>
+    <label><span class="form-label">Novo tempo acumulado</span><input class="inp" id="editSplitTime" value="${formatEditableTime(split.cum)}" inputmode="decimal"></label>`,
+    [
+      { label: 'Guardar correção', cls: 'btn-primary', fn: () => saveEditedLiveSplitTime(athleteId, splitId) },
+      { label: 'Cancelar', cls: 'btn-secondary', fn: closeModal },
+    ]);
+}
+
+function saveEditedLiveSplitTime(athleteId, splitId) {
+  const split = findLiveSplit(athleteId, splitId);
+  if (!split) {
+    toast('Parcial não encontrado.');
+    closeModal();
+    renderTab();
+    return;
+  }
+  const ms = parseTimeInputToMs($('editSplitTime')?.value);
+  if (ms === null) {
+    toast('Tempo inválido. Use 01:12.34 ou 72.34.');
+    return;
+  }
+  if (split.originalCum === undefined) split.originalCum = split.cum;
+  split.cum = ms;
+  split.corrected = true;
+  split.correctedAt = new Date().toISOString();
+  recomputeAthleteSplits(athleteId);
+  saveState();
+  closeModal();
+  renderTab();
+  toast('Tempo corrigido.');
+}
+
+function showMoveLiveSplitModal(athleteId, splitId) {
+  const split = findLiveSplit(athleteId, splitId);
+  if (!split) {
+    toast('Parcial não encontrado.');
+    return;
+  }
+  const current = S.athletes.find((a) => String(a.id) === String(athleteId));
+  const options = S.athletes
+    .filter((a) => String(a.id) !== String(athleteId))
+    .map((a) => `<option value="${esc(a.id)}">${esc(a.nome)}</option>`)
+    .join('');
+  if (!options) {
+    toast('Não há outro atleta para mover.');
+    return;
+  }
+  showModal('Mover parcial',
+    `<div style="font-size:13px;color:#6b85a8;line-height:1.5;margin-bottom:10px;">
+      Move este parcial de <strong>${esc(current?.nome || 'Atleta')}</strong> para outro atleta. Os parciais dos dois atletas serão recalculados.
+    </div>
+    <div class="info-bar">Parcial: <strong>${esc(split.label || ('#' + split.splitNo))}</strong> · ${fmtTime(split.cum)}</div>
+    <label><span class="form-label">Mover para</span><select class="sel" id="moveSplitAthlete">${options}</select></label>`,
+    [
+      { label: 'Mover parcial', cls: 'btn-primary', fn: () => saveMoveLiveSplit(athleteId, splitId) },
+      { label: 'Cancelar', cls: 'btn-secondary', fn: closeModal },
+    ]);
+}
+
+function saveMoveLiveSplit(fromAthleteId, splitId) {
+  const session = S.activeSession;
+  const toAthleteId = String($('moveSplitAthlete')?.value || '');
+  if (!session || !toAthleteId || String(fromAthleteId) === toAthleteId) {
+    toast('Escolha outro atleta.');
+    return;
+  }
+  const fromList = session.splitsByAthlete?.[fromAthleteId] || [];
+  const idx = fromList.findIndex((sp) => String(sp.id) === String(splitId));
+  if (idx < 0) {
+    toast('Parcial não encontrado.');
+    return;
+  }
+  const [split] = fromList.splice(idx, 1);
+  const athlete = S.athletes.find((a) => String(a.id) === toAthleteId);
+  split.athleteId = toAthleteId;
+  split.athleteName = athlete?.nome || 'Atleta';
+  if (!session.splitsByAthlete[toAthleteId]) session.splitsByAthlete[toAthleteId] = [];
+  session.splitsByAthlete[toAthleteId].push(split);
+  (session.history || []).forEach((h) => { if (String(h.splitId) === String(splitId)) h.athleteId = toAthleteId; });
+  recomputeAthleteSplits(fromAthleteId);
+  recomputeAthleteSplits(toAthleteId);
+  saveState();
+  closeModal();
+  renderTab();
+  toast('Parcial movido.');
 }
 
 function finishLiveSession() {
@@ -986,6 +1378,7 @@ function finishLiveSession() {
       ciclo: ex.ciclo || '',
       pool: ex.pool || '',
       splitDistance: session.splitDistance,
+      exerciseStructure: session.exerciseStructure || ex.structure || null,
       targetTime: ex.target || '',
       splits: splits.map((s) => ({
         id: s.id,
@@ -996,13 +1389,17 @@ function finishLiveSession() {
         repetition: s.repetition,
         distanceMarker: s.distanceMarker,
         totalDistance: s.totalDistance,
+        expectedSplits: s.expectedSplits || '',
+        targetExpectedMs: s.targetExpectedMs ?? null,
+        lapTargetMs: s.lapTargetMs ?? null,
         targetDiffMs: s.targetDiffMs,
       })),
     });
   });
+  const loggedZone = autoLogFinishedSessionZone(session);
   saveState();
   renderTab();
-  toast('Sessão terminada e resultados guardados.');
+  toast(loggedZone ? 'Sessão terminada, resultados guardados e zonas atualizadas.' : 'Sessão terminada e resultados guardados.');
 }
 
 function clearFinishedSession() {
@@ -1024,6 +1421,95 @@ function discardActiveSession() {
       { label: 'Descartar', cls: 'btn-danger', fn: () => { if (S.activeSession?.running) releaseWakeLock(); S.activeSession = null; saveState(); closeModal(); renderTab(); } },
       { label: 'Cancelar', cls: 'btn-secondary', fn: closeModal },
     ]);
+}
+
+
+function canEditActiveStructure() {
+  return !(S.activeSession?.status === 'active' && hasSplits(S.activeSession));
+}
+
+function showExerciseStructureModal() {
+  const session = ensureLiveSession();
+  if (!session) return;
+  const locked = hasSplits(session);
+  const st = getActiveStructure(session);
+  const disabled = locked ? 'disabled' : '';
+  showModal('Estrutura do exercício',
+    `<div style="font-size:13px;color:#6b85a8;line-height:1.5;margin-bottom:10px;">
+      A app tenta detetar formatos simples como <strong>8 x 100</strong>. Se o plano for mais complexo, defina manualmente. Depois do primeiro parcial, esta estrutura fica bloqueada.
+    </div>
+    <div class="info-bar">Atual: <strong>${esc(structureSummaryText(st))}</strong></div>
+    <div class="form-row">
+      <label style="flex:1;"><span class="form-label">Repetições</span><input class="inp" id="structReps" type="number" min="1" step="1" value="${st?.repetitions || ''}" ${disabled}></label>
+      <label style="flex:1;"><span class="form-label">Distância por repetição</span><input class="inp" id="structRepDistance" type="number" min="1" step="1" value="${st?.distancePerRep || ''}" ${disabled}></label>
+    </div>
+    <div class="form-row">
+      <label style="flex:1;"><span class="form-label">Parcial</span><select class="sel" id="structSplitDistance" ${disabled}>
+        <option value="25" ${currentSplitDistance() === 25 ? 'selected' : ''}>25m</option>
+        <option value="50" ${currentSplitDistance() === 50 ? 'selected' : ''}>50m</option>
+      </select></label>
+      <label style="flex:1;"><span class="form-label">Total calculado</span><input class="inp" value="${st?.totalDistance || ''}m" disabled></label>
+    </div>
+    ${locked ? '<div class="warn-box">A estrutura está bloqueada porque já existem parciais. Remova os parciais ou descarte a sessão para alterar.</div>' : ''}`,
+    locked ? [
+      { label: 'Fechar', cls: 'btn-secondary', fn: closeModal },
+    ] : [
+      { label: 'Guardar estrutura', cls: 'btn-primary', fn: saveExerciseStructureFromModal },
+      { label: 'Cancelar', cls: 'btn-secondary', fn: closeModal },
+    ]);
+}
+
+function saveExerciseStructureFromModal() {
+  const session = ensureLiveSession();
+  if (!session) return;
+  if (hasSplits(session)) {
+    toast('A estrutura está bloqueada após o primeiro parcial.');
+    closeModal();
+    renderTab();
+    return;
+  }
+  const repetitions = parseMeters($('structReps')?.value);
+  const distancePerRep = parseMeters($('structRepDistance')?.value);
+  const splitDistance = Number($('structSplitDistance')?.value) || currentSplitDistance();
+  if (!repetitions || !distancePerRep) {
+    toast('Defina repetições e distância por repetição.');
+    return;
+  }
+  if (![25, 50].includes(splitDistance)) {
+    toast('Escolha parcial de 25m ou 50m.');
+    return;
+  }
+  S.liveSplitDistance = splitDistance;
+  session.splitDistance = splitDistance;
+  session.exerciseStructure = normalizeExerciseStructure({
+    repetitions,
+    distancePerRep,
+    totalDistance: repetitions * distancePerRep,
+    source: 'manual',
+    detectedAutomatically: false,
+    manuallyEdited: true,
+  }, session.exerciseSnapshot, splitDistance);
+  session.exerciseSnapshot.structure = session.exerciseStructure;
+  saveState();
+  closeModal();
+  renderTab();
+  toast('Estrutura guardada.');
+}
+
+function autoLogFinishedSessionZone(session) {
+  if (!session || session.zoneLogged) return false;
+  const ex = session.exerciseSnapshot || {};
+  const zona = ex.zona || '';
+  const metros = parseMeters(ex.metros);
+  if (!zona || !ZONAS.includes(zona) || !metros) {
+    session.zoneLogged = true;
+    return false;
+  }
+  const key = `${ex.dayIdx}_${ex.sess}`;
+  if (!S.zoneLog[key]) S.zoneLog[key] = zoneTotals();
+  S.zoneLog[key][zona] = (S.zoneLog[key][zona] || 0) + metros;
+  session.zoneLogged = true;
+  return true;
 }
 
 function renderAthleteChips() {
@@ -1061,12 +1547,17 @@ function renderLiveSplits() {
     const name = athlete?.nome || session.splitsByAthlete[aid][0]?.athleteName || 'Atleta';
     return `<div class="live-split-group">
       <div class="live-split-title">${esc(name)} <span>${session.splitsByAthlete[aid].length} parcial${session.splitsByAthlete[aid].length !== 1 ? 'is' : ''}</span></div>
-      <div class="live-split-table">${session.splitsByAthlete[aid].map((s) => `<div class="live-split-row">
-        <span>${esc(s.label || `#${s.splitNo}`)}</span>
-        <strong>${fmtTime(s.cum)}</strong>
-        <span>${fmtTime(s.lap)}</span>
-        ${s.targetDiffMs !== null && s.targetDiffMs !== undefined ? `<span class="${s.targetDiffMs > 0 ? 'lap-slow' : 'lap-fast'}">${s.targetDiffMs >= 0 ? '+' : ''}${fmtTime(Math.abs(s.targetDiffMs))}</span>` : '<span></span>'}
-        <button onclick="deleteLiveSplit('${esc(aid)}','${esc(s.id)}')">✕</button>
+      <div class="live-split-head"><span>Parcial</span><span>Acum.</span><span>Volta</span><span>vs alvo</span><span>Ações</span></div>
+      <div class="live-split-table">${session.splitsByAthlete[aid].map((sp) => `<div class="live-split-row${sp.corrected ? ' corrected' : ''}">
+        <span>${esc(sp.label || ('#' + sp.splitNo))}${sp.corrected ? ' ✎' : ''}</span>
+        <strong>${fmtTime(sp.cum)}</strong>
+        <span>${fmtTime(sp.lap)}</span>
+        ${sp.targetDiffMs !== null && sp.targetDiffMs !== undefined ? `<span class="${sp.targetDiffMs > 0 ? 'lap-slow' : 'lap-fast'}">${describeSplitDelta(sp.targetDiffMs)}</span>` : '<span>—</span>'}
+        <span class="split-actions">
+          <button title="Editar tempo" onclick="showEditLiveSplitModal('${esc(aid)}','${esc(sp.id)}')">✎</button>
+          <button title="Mover para outro atleta" onclick="showMoveLiveSplitModal('${esc(aid)}','${esc(sp.id)}')">⇄</button>
+          <button title="Apagar parcial" onclick="deleteLiveSplit('${esc(aid)}','${esc(sp.id)}')">✕</button>
+        </span>
       </div>`).join('')}</div>
     </div>`;
   }).join('')}</div>`;
@@ -1091,6 +1582,7 @@ function renderLiveTimingPanel() {
       <div class="live-ex-title">${esc(ex.blockName)} — ${esc(ex.zona || '—')}</div>
       <div class="live-ex-desc">${esc(ex.desc || '—')}</div>
       <div class="live-ex-meta">${esc(ex.day)} · ${esc(ex.sessionLabel)} · ${esc(ex.pool || 'Piscina?')} · ${ex.metros ? `${ex.metros}m` : 'metros?'}${ex.ciclo ? ` · ${esc(ex.ciclo)}` : ''}${ex.target ? ` · Alvo total ${esc(ex.target)}` : ''}</div>
+      <div class="structure-pill"><span>Estrutura: ${esc(structureSummaryText(getActiveStructure(session)))}</span><button class="btn btn-secondary btn-sm" onclick="showExerciseStructureModal()" ${session?.status === 'finished' ? 'disabled' : ''}>Editar</button></div>
     </div>
 
     <div class="card">
@@ -1107,7 +1599,7 @@ function renderLiveTimingPanel() {
       <div class="sw-info">${totalSplitCount(session)} parcial${totalSplitCount(session) !== 1 ? 'is' : ''}${finished ? ' · sessão terminada' : ''}</div>
       <div class="sw-controls live-controls">
         <button class="sw-btn start" onclick="toggleLiveSW()" ${finished ? 'disabled' : ''}>${session?.running ? 'Parar' : session?.elapsed ? 'Retomar' : 'Iniciar'}</button>
-        <button class="sw-btn split" onclick="takeLiveSplit()" ${!canSplit || finished ? 'disabled' : ''}>${activeAthlete ? `Split ${esc(activeAthlete.nome)}` : 'Split'}</button>
+        <button class="sw-btn split" onclick="takeLiveSplit()" ${!canSplit || finished ? 'disabled' : ''}>${activeAthlete ? `Split ${esc(activeAthlete.nome)}${next ? ` · ${esc(next.label)}` : ''}` : 'Split'}</button>
         <button class="sw-btn split" onclick="undoLastLiveSplit()" ${!session?.history?.length || finished ? 'disabled' : ''}>Undo</button>
       </div>
       <div class="finish-row">
@@ -1132,7 +1624,7 @@ function renderLive() {
       ${dayTabsHTML()}
       <div class="live-left-head">
         <div><strong>${esc(DIAS[S.dayIdx])} — ${S.sessao === 'manha' ? 'Manhã' : 'Tarde'}</strong>${piscina ? `<span class="tag">${esc(piscina)}</span>` : ''}</div>
-        <span>${totalP}m</span>
+        <div style="display:flex;align-items:center;gap:8px;"><span>${totalP}m</span><button class="btn btn-secondary btn-sm" onclick="showPlanManager()">Gerir plano</button></div>
       </div>
       ${renderExerciseSections(S.dayIdx, S.sessao, { goLive: true })}
     </aside>
@@ -1159,6 +1651,7 @@ function renderZonas() {
 
   let html = dayTabsHTML();
   html += selectedExerciseBannerHTML();
+  html += `<div class="info-bar">Realizado inclui exercícios terminados no Live e metros registados manualmente. A conclusão de um exercício soma os metros da linha uma única vez, não por atleta.</div>`;
   html += `<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px;">
     <div class="zone-metric"><div class="lbl">Planeado</div><div class="val">${totalP}m</div></div>
     <div class="zone-metric"><div class="lbl">Realizado</div><div class="val">${totalL}m</div></div>
@@ -1288,6 +1781,272 @@ function confirmRemoveAthlete(id) {
 // ============================================================
 // RESULTADOS
 // ============================================================
+function findResult(resultId) {
+  return S.results.find((r) => String(r.id) === String(resultId)) || null;
+}
+
+function resultSnapshot(result) {
+  if (!result) return null;
+  return {
+    id: result.exerciseId || '',
+    dayIdx: result.diaIdx,
+    sess: result.sessao,
+    day: result.dia,
+    sessionLabel: result.sessao === 'manha' ? 'Manhã' : 'Tarde',
+    blockName: result.bloco || '—',
+    blockTipo: 'tarefa',
+    index: 0,
+    zona: result.zone || '',
+    desc: result.exerciseDesc || '',
+    metros: parseMeters(result.meters),
+    ciclo: result.ciclo || '',
+    target: result.targetTime || '',
+    pool: result.pool || '',
+    structure: result.exerciseStructure || null,
+  };
+}
+
+function recomputeResultSplits(result) {
+  if (!result?.splits) return;
+  const snapshot = resultSnapshot(result);
+  const splitDistance = Number(result.splitDistance) || 25;
+  const structure = normalizeExerciseStructure(result.exerciseStructure || snapshot?.structure, snapshot, splitDistance);
+  result.exerciseStructure = structure;
+  result.splits.sort((a, b) => a.cum - b.cum);
+  result.splits.forEach((sp, idx) => {
+    const splitNo = idx + 1;
+    const meta = splitMeta(splitNo, splitDistance, snapshot, structure);
+    const prevCum = idx ? result.splits[idx - 1].cum : 0;
+    const targetExpectedMs = targetForDistance(snapshot, meta.totalDistance, structure);
+    sp.splitNo = splitNo;
+    sp.lap = sp.cum - prevCum;
+    sp.label = meta.label;
+    sp.repetition = meta.repetition;
+    sp.distanceMarker = meta.distanceMarker;
+    sp.totalDistance = meta.totalDistance;
+    sp.expectedSplits = meta.expectedSplits || '';
+    sp.targetExpectedMs = targetExpectedMs;
+    sp.lapTargetMs = splitTargetForDistance(snapshot, splitDistance, structure, splitNo);
+    sp.targetDiffMs = targetExpectedMs === null ? null : sp.cum - targetExpectedMs;
+  });
+}
+
+function exerciseOptionsHTML(selectedExerciseId = '') {
+  const entries = [];
+  Object.keys(S.weekPlan || {}).forEach((dayKey) => {
+    ['manha', 'tarde'].forEach((sess) => {
+      getExerciseEntries(Number(dayKey), sess).forEach((entry) => entries.push(entry));
+    });
+  });
+  if (!entries.length) return '<option value="">Sem plano carregado — manter exercício atual</option>';
+  return '<option value="">Manter exercício atual</option>' + entries.map((entry) => {
+    const snap = buildExerciseSnapshot(entry.dayIdx, entry.sess, entry.idx);
+    const label = `${snap.day} · ${snap.sessionLabel} · ${snap.blockName} · ${snap.zona || '—'} · ${snap.desc || '—'}`;
+    return `<option value="${esc(snap.id)}" ${snap.id === selectedExerciseId ? 'selected' : ''}>${esc(label)}</option>`;
+  }).join('');
+}
+
+function snapshotFromExerciseId(exerciseId) {
+  if (!exerciseId) return null;
+  const parts = String(exerciseId).split('_');
+  if (parts.length < 3) return null;
+  return buildExerciseSnapshot(Number(parts[0]), parts[1], Number(parts[2]));
+}
+
+function applySnapshotToResult(result, snap) {
+  if (!result || !snap) return;
+  result.dia = snap.day;
+  result.diaIdx = snap.dayIdx;
+  result.sessao = snap.sess;
+  result.bloco = snap.blockName || '—';
+  result.exerciseId = snap.id;
+  result.exerciseDesc = snap.desc || '';
+  result.zone = snap.zona || '';
+  result.meters = snap.metros || 0;
+  result.ciclo = snap.ciclo || '';
+  result.pool = snap.pool || '';
+  result.targetTime = snap.target || '';
+  result.exerciseStructure = normalizeExerciseStructure(snap.structure || inferExerciseStructure(snap), snap, Number(result.splitDistance) || currentSplitDistance());
+  recomputeResultSplits(result);
+}
+
+function showEditResultModal(resultId) {
+  const result = findResult(resultId);
+  if (!result) {
+    toast('Resultado não encontrado.');
+    return;
+  }
+  const athleteOptions = S.athletes.length
+    ? S.athletes.map((a) => `<option value="${esc(a.id)}" ${String(a.id) === String(result.athleteId) ? 'selected' : ''}>${esc(a.nome)}</option>`).join('')
+    : `<option value="${esc(result.athleteId || '')}">${esc(result.athlete || 'Atleta')}</option>`;
+  showModal('Editar resultado',
+    `<div style="font-size:13px;color:#6b85a8;line-height:1.5;margin-bottom:10px;">
+      Corrija o atleta ou mova este resultado para outro exercício do plano atual. Os rótulos dos parciais serão recalculados.
+    </div>
+    <div class="form-row">
+      <label style="flex:1;"><span class="form-label">Atleta</span><select class="sel" id="editResultAthlete">${athleteOptions}</select></label>
+    </div>
+    <div class="form-row">
+      <label style="flex:1;"><span class="form-label">Exercício</span><select class="sel" id="editResultExercise">${exerciseOptionsHTML(result.exerciseId)}</select></label>
+    </div>
+    <div class="info-bar">Atual: <strong>${esc(result.athlete)}</strong> · ${esc(result.bloco)} · ${esc(result.exerciseDesc || '—')}</div>`,
+    [
+      { label: 'Guardar alterações', cls: 'btn-primary', fn: () => saveResultEdit(resultId) },
+      { label: 'Cancelar', cls: 'btn-secondary', fn: closeModal },
+    ]);
+}
+
+function saveResultEdit(resultId) {
+  const result = findResult(resultId);
+  if (!result) {
+    toast('Resultado não encontrado.');
+    return;
+  }
+  const athleteId = String($('editResultAthlete')?.value || result.athleteId || '');
+  const athlete = S.athletes.find((a) => String(a.id) === athleteId);
+  if (athlete) {
+    result.athleteId = String(athlete.id);
+    result.athlete = athlete.nome;
+  }
+  const exerciseId = $('editResultExercise')?.value || '';
+  const snap = snapshotFromExerciseId(exerciseId);
+  if (snap) applySnapshotToResult(result, snap);
+  else recomputeResultSplits(result);
+  result.lastEditedAt = new Date().toISOString();
+  saveState();
+  closeModal();
+  renderTab();
+  toast('Resultado atualizado.');
+}
+
+function findResultSplit(resultId, splitId) {
+  const result = findResult(resultId);
+  const split = result?.splits?.find((sp) => String(sp.id) === String(splitId)) || null;
+  return { result, split };
+}
+
+function showEditResultSplitTimeModal(resultId, splitId) {
+  const { result, split } = findResultSplit(resultId, splitId);
+  if (!result || !split) {
+    toast('Parcial não encontrado.');
+    return;
+  }
+  showModal('Editar tempo guardado',
+    `<div style="font-size:13px;color:#6b85a8;line-height:1.5;margin-bottom:10px;">
+      Corrija o tempo acumulado. Isto recalcula a volta e o delta de alvo deste resultado.
+    </div>
+    <div class="info-bar">${esc(result.athlete)} · <strong>${esc(split.label || ('#' + split.splitNo))}</strong> · ${fmtTime(split.cum)}</div>
+    <label><span class="form-label">Novo tempo acumulado</span><input class="inp" id="editResultSplitTime" value="${formatEditableTime(split.cum)}" inputmode="decimal"></label>`,
+    [
+      { label: 'Guardar correção', cls: 'btn-primary', fn: () => saveEditedResultSplitTime(resultId, splitId) },
+      { label: 'Cancelar', cls: 'btn-secondary', fn: closeModal },
+    ]);
+}
+
+function saveEditedResultSplitTime(resultId, splitId) {
+  const { result, split } = findResultSplit(resultId, splitId);
+  if (!result || !split) {
+    toast('Parcial não encontrado.');
+    return;
+  }
+  const ms = parseTimeInputToMs($('editResultSplitTime')?.value);
+  if (ms === null) {
+    toast('Tempo inválido. Use 01:12.34 ou 72.34.');
+    return;
+  }
+  if (split.originalCum === undefined) split.originalCum = split.cum;
+  split.cum = ms;
+  split.corrected = true;
+  result.lastEditedAt = new Date().toISOString();
+  recomputeResultSplits(result);
+  saveState();
+  closeModal();
+  renderTab();
+  toast('Tempo corrigido.');
+}
+
+function deleteResultSplit(resultId, splitId) {
+  const { result } = findResultSplit(resultId, splitId);
+  if (!result) return;
+  result.splits = result.splits.filter((sp) => String(sp.id) !== String(splitId));
+  if (!result.splits.length) {
+    S.results = S.results.filter((r) => String(r.id) !== String(resultId));
+    toast('Resultado removido porque ficou sem parciais.');
+  } else {
+    result.lastEditedAt = new Date().toISOString();
+    recomputeResultSplits(result);
+    toast('Parcial apagado.');
+  }
+  saveState();
+  renderTab();
+}
+
+function showMoveResultSplitModal(resultId, splitId) {
+  const { result, split } = findResultSplit(resultId, splitId);
+  if (!result || !split) {
+    toast('Parcial não encontrado.');
+    return;
+  }
+  const options = S.athletes
+    .filter((a) => String(a.id) !== String(result.athleteId))
+    .map((a) => `<option value="${esc(a.id)}">${esc(a.nome)}</option>`)
+    .join('');
+  if (!options) {
+    toast('Não há outro atleta para mover.');
+    return;
+  }
+  showModal('Mover parcial guardado',
+    `<div style="font-size:13px;color:#6b85a8;line-height:1.5;margin-bottom:10px;">
+      Move este parcial de <strong>${esc(result.athlete)}</strong> para outro atleta dentro da mesma sessão/exercício. Os parciais serão recalculados.
+    </div>
+    <div class="info-bar">Parcial: <strong>${esc(split.label || ('#' + split.splitNo))}</strong> · ${fmtTime(split.cum)}</div>
+    <label><span class="form-label">Mover para</span><select class="sel" id="moveResultSplitAthlete">${options}</select></label>`,
+    [
+      { label: 'Mover parcial', cls: 'btn-primary', fn: () => saveMoveResultSplit(resultId, splitId) },
+      { label: 'Cancelar', cls: 'btn-secondary', fn: closeModal },
+    ]);
+}
+
+function cloneResultShellForAthlete(source, athlete) {
+  return {
+    ...source,
+    id: uid('result'),
+    athleteId: String(athlete.id),
+    athlete: athlete.nome,
+    splits: [],
+    lastEditedAt: new Date().toISOString(),
+  };
+}
+
+function saveMoveResultSplit(fromResultId, splitId) {
+  const { result: fromResult, split } = findResultSplit(fromResultId, splitId);
+  const toAthleteId = String($('moveResultSplitAthlete')?.value || '');
+  const athlete = S.athletes.find((a) => String(a.id) === toAthleteId);
+  if (!fromResult || !split || !athlete) {
+    toast('Escolha um atleta válido.');
+    return;
+  }
+  fromResult.splits = fromResult.splits.filter((sp) => String(sp.id) !== String(splitId));
+  let toResult = S.results.find((r) => String(r.sessionId) === String(fromResult.sessionId) && String(r.athleteId) === toAthleteId && String(r.exerciseId) === String(fromResult.exerciseId));
+  if (!toResult) {
+    toResult = cloneResultShellForAthlete(fromResult, athlete);
+    S.results.push(toResult);
+  }
+  toResult.splits.push(split);
+  toResult.lastEditedAt = new Date().toISOString();
+  if (fromResult.splits.length) {
+    fromResult.lastEditedAt = new Date().toISOString();
+    recomputeResultSplits(fromResult);
+  } else {
+    S.results = S.results.filter((r) => String(r.id) !== String(fromResultId));
+  }
+  recomputeResultSplits(toResult);
+  saveState();
+  closeModal();
+  renderTab();
+  toast('Parcial movido.');
+}
+
 function renderResultados() {
   const athletes = [...new Set(S.results.map((r) => r.athlete))].sort();
   const dias = [...new Set(S.results.map((r) => r.dia))];
@@ -1302,22 +2061,23 @@ function renderResultados() {
     <select class="sel" id="rFiltA" style="flex:1;" onchange="renderTab()"><option value="">Todos os atletas</option>${athletes.map((a) => `<option ${fa === a ? 'selected' : ''}>${esc(a)}</option>`).join('')}</select>
     <select class="sel" id="rFiltD" style="flex:1;" onchange="renderTab()"><option value="">Todos os dias</option>${dias.map((d) => `<option ${fd === d ? 'selected' : ''}>${esc(d)}</option>`).join('')}</select>
     <button class="btn btn-secondary btn-sm" onclick="exportCSV()">CSV</button>
-  </div>`;
+  </div>
+  <div class="info-bar">Fase 4: pode editar tempos, mover parciais entre atletas, mover resultados para outro atleta/exercício e apagar parciais. Se apagar resultados, as Zonas não são revertidas automaticamente; ajuste em Zonas se necessário.</div>`;
 
   if (!data.length) {
     html += `<div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 17H5a2 2 0 01-2-2V5a2 2 0 012-2h14a2 2 0 012 2v5"/><path d="M9 11l3 3L22 4"/></svg><div>Sem resultados guardados.</div></div>`;
   } else {
     html += data.slice().reverse().map((r) => {
-      const avg = r.splits.reduce((a, s) => a + s.lap, 0) / (r.splits.length || 1);
+      const avg = r.splits.reduce((a, sp) => a + sp.lap, 0) / (r.splits.length || 1);
       return `<div class="result-card"><div class="result-header">
-        <div><div class="result-name">${esc(r.athlete)}</div><div class="result-meta">${esc(r.dia)} · ${r.sessao === 'manha' ? 'Manhã' : 'Tarde'} · ${esc(r.date)} · ${esc(r.bloco)}${r.exerciseDesc ? ` · ${esc(r.exerciseDesc)}` : ''}${r.zone ? ` · ${esc(r.zone)}` : ''}${r.targetTime ? ` · Alvo total ${esc(r.targetTime)}` : ''}</div></div>
-        <button class="btn btn-danger btn-sm" onclick="deleteResult('${esc(r.id)}')">✕</button>
+        <div><div class="result-name">${esc(r.athlete)}</div><div class="result-meta">${esc(r.dia)} · ${r.sessao === 'manha' ? 'Manhã' : 'Tarde'} · ${esc(r.date)} · ${esc(r.bloco)}${r.exerciseDesc ? ` · ${esc(r.exerciseDesc)}` : ''}${r.zone ? ` · ${esc(r.zone)}` : ''}${r.exerciseStructure ? ` · ${esc(structureSummaryText(r.exerciseStructure))}` : ''}${r.targetTime ? ` · Alvo total ${esc(r.targetTime)}` : ''}${r.lastEditedAt ? ' · editado' : ''}</div></div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;"><button class="btn btn-secondary btn-sm" onclick="showEditResultModal('${esc(r.id)}')">Editar</button><button class="btn btn-danger btn-sm" onclick="deleteResult('${esc(r.id)}')">✕</button></div>
       </div><div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums;">
-        <thead><tr style="color:#4a6490;"><th style="text-align:left;padding:4px 6px;">Parcial</th><th style="text-align:right;padding:4px 6px;">Acum.</th><th style="text-align:right;padding:4px 6px;">Volta</th><th style="text-align:right;padding:4px 6px;">vs Média</th><th style="text-align:right;padding:4px 6px;">vs Alvo</th></tr></thead>
-        <tbody>${r.splits.map((s, i) => {
-          const d = s.lap - avg;
-          const td = s.targetDiffMs;
-          return `<tr style="border-top:1px solid #111d33;"><td style="padding:5px 6px;color:#4a6490;">${esc(s.label || `#${i + 1}`)}</td><td style="text-align:right;padding:5px 6px;color:#a8c0e0;font-weight:600;">${fmtTime(s.cum)}</td><td style="text-align:right;padding:5px 6px;color:#6b85a8;">${fmtTime(s.lap)}</td><td style="text-align:right;padding:5px 6px;" class="${i > 0 ? (d > 0 ? 'lap-slow' : 'lap-fast') : ''}">${i > 0 ? `${d >= 0 ? '+' : ''}${fmtTime(Math.abs(d))}` : '—'}</td><td style="text-align:right;padding:5px 6px;" class="${td > 0 ? 'lap-slow' : 'lap-fast'}">${td === null || td === undefined ? '—' : `${td >= 0 ? '+' : ''}${fmtTime(Math.abs(td))}`}</td></tr>`;
+        <thead><tr style="color:#4a6490;"><th style="text-align:left;padding:4px 6px;">Parcial</th><th style="text-align:right;padding:4px 6px;">Acum.</th><th style="text-align:right;padding:4px 6px;">Volta</th><th style="text-align:right;padding:4px 6px;">vs Média</th><th style="text-align:right;padding:4px 6px;">vs Alvo</th><th style="text-align:right;padding:4px 6px;">Ações</th></tr></thead>
+        <tbody>${r.splits.map((sp, i) => {
+          const d = sp.lap - avg;
+          const td = sp.targetDiffMs;
+          return `<tr style="border-top:1px solid #111d33;"><td style="padding:5px 6px;color:#4a6490;">${esc(sp.label || ('#' + (i + 1)))}${sp.corrected ? ' ✎' : ''}</td><td style="text-align:right;padding:5px 6px;color:#a8c0e0;font-weight:600;">${fmtTime(sp.cum)}</td><td style="text-align:right;padding:5px 6px;color:#6b85a8;">${fmtTime(sp.lap)}</td><td style="text-align:right;padding:5px 6px;" class="${i > 0 ? (d > 0 ? 'lap-slow' : 'lap-fast') : ''}">${i > 0 ? describeSplitDelta(d) : '—'}</td><td style="text-align:right;padding:5px 6px;" class="${td > 0 ? 'lap-slow' : 'lap-fast'}">${td === null || td === undefined ? '—' : describeSplitDelta(td)}</td><td style="text-align:right;padding:5px 6px;"><span class="result-actions"><button title="Editar tempo" onclick="showEditResultSplitTimeModal('${esc(r.id)}','${esc(sp.id)}')">✎</button><button title="Mover parcial" onclick="showMoveResultSplitModal('${esc(r.id)}','${esc(sp.id)}')">⇄</button><button title="Apagar parcial" onclick="deleteResultSplit('${esc(r.id)}','${esc(sp.id)}')">✕</button></span></td></tr>`;
         }).join('')}</tbody></table></div></div>`;
     }).join('');
   }
@@ -1325,8 +2085,23 @@ function renderResultados() {
 }
 
 function deleteResult(id) {
+  const result = findResult(id);
+  if (!result) return;
+  showModal('Apagar resultado',
+    `<div style="font-size:13px;color:#6b85a8;line-height:1.5;">
+      Vai apagar o resultado de <strong>${esc(result.athlete)}</strong> para <strong>${esc(result.exerciseDesc || result.bloco || 'exercício')}</strong>.
+      <br><br>As Zonas não serão revertidas automaticamente. Ajuste manualmente em Zonas se necessário.
+    </div>`,
+    [
+      { label: 'Apagar resultado', cls: 'btn-danger', fn: () => confirmDeleteResult(id) },
+      { label: 'Cancelar', cls: 'btn-secondary', fn: closeModal },
+    ]);
+}
+
+function confirmDeleteResult(id) {
   S.results = S.results.filter((r) => String(r.id) !== String(id));
   saveState();
+  closeModal();
   renderTab();
   toast('Resultado apagado.');
 }
@@ -1334,7 +2109,7 @@ function deleteResult(id) {
 function exportCSV() {
   if (!S.results.length) { toast('Sem resultados para exportar.'); return; }
   const rows = [[
-    'SessionID', 'Data', 'Dia', 'Sessão', 'Atleta', 'Bloco', 'Exercício', 'Zona', 'Metros', 'Piscina', 'SplitDistance', 'AlvoTotal', 'Parcial', 'Repetição', 'DistânciaParcial', 'DistânciaTotal', 'Acumulado', 'Volta', 'DeltaAlvoFinal'
+    'SessionID', 'Data', 'Dia', 'Sessão', 'Atleta', 'Bloco', 'Exercício', 'Zona', 'Metros', 'Piscina', 'SplitDistance', 'AlvoTotal', 'Estrutura', 'Parcial', 'Repetição', 'DistânciaParcial', 'DistânciaTotal', 'Acumulado', 'Volta', 'AlvoAcumulado', 'DeltaAlvoAcumulado', 'Corrigido', 'OriginalAcumulado'
   ]];
   S.results.forEach((r) => r.splits.forEach((s, i) => rows.push([
     r.sessionId || '',
@@ -1349,13 +2124,17 @@ function exportCSV() {
     r.pool || '',
     r.splitDistance || '',
     r.targetTime || '',
+    r.exerciseStructure ? structureSummaryText(r.exerciseStructure) : '',
     s.label || i + 1,
     s.repetition || '',
     s.distanceMarker || '',
     s.totalDistance || '',
     fmtTime(s.cum),
     fmtTime(s.lap),
+    s.targetExpectedMs === null || s.targetExpectedMs === undefined ? '' : fmtTime(s.targetExpectedMs),
     s.targetDiffMs === null || s.targetDiffMs === undefined ? '' : `${s.targetDiffMs >= 0 ? '+' : '-'}${fmtTime(Math.abs(s.targetDiffMs))}`,
+    s.corrected ? 'sim' : '',
+    s.originalCum === undefined ? '' : fmtTime(s.originalCum),
   ])));
   const csv = rows.map((r) => r.map((v) => JSON.stringify(String(v))).join(',')).join('\n');
   const url = URL.createObjectURL(new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' }));
