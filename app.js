@@ -53,6 +53,7 @@ function defaultState() {
     athletes: [],
     results: [],
     zoneLog: {},
+    weekLabel: '',
     selectedExerciseId: '',
     selectedExercise: null,
     activeAthleteId: '',
@@ -177,6 +178,7 @@ function loadState() {
         zoneLog: d.zoneLog || {},
         weekPlan: d.weekPlan || {},
         zonePlan: d.zonePlan || {},
+        weekLabel: d.weekLabel || '',
         selectedExerciseId: d.selectedExerciseId || '',
         selectedExercise: d.selectedExercise || null,
         activeAthleteId: d.activeAthleteId || d.cronoAthleteId || '',
@@ -198,6 +200,7 @@ function saveState() {
       zoneLog: S.zoneLog,
       weekPlan: S.weekPlan,
       zonePlan: S.zonePlan,
+      weekLabel: S.weekLabel,
       selectedExerciseId: S.selectedExerciseId,
       selectedExercise: S.selectedExercise,
       activeAthleteId: S.activeAthleteId,
@@ -495,7 +498,10 @@ function renderPlano() {
       <span style="font-size:15px;font-weight:700;color:#a8c0e0;">${esc(DIAS[S.dayIdx])} — ${S.sessao === 'manha' ? 'Manhã' : 'Tarde'}</span>
       ${piscina ? `<span class="tag" style="margin-left:6px;">${esc(piscina)}</span>` : ''}
     </div>
-    <div style="font-size:12px;color:#4a6490;white-space:nowrap;">Total: <strong style="color:#4d9fff">${totalP}m</strong></div>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <div style="font-size:12px;color:#4a6490;white-space:nowrap;">Total: <strong style="color:#4d9fff">${totalP}m</strong></div>
+      <button class="btn btn-secondary btn-sm" onclick="showPlanManager()">Gerir plano</button>
+    </div>
   </div>`;
 
   html += `<div class="card" style="margin-bottom:10px;">
@@ -513,6 +519,148 @@ function renderPlano() {
 }
 
 // ============================================================
+// PLAN MANAGEMENT
+// ============================================================
+function planStats() {
+  const days = Object.keys(S.weekPlan || {}).length;
+  let exercises = 0;
+  let meters = 0;
+  Object.values(S.weekPlan || {}).forEach((day) => {
+    ['manha', 'tarde'].forEach((sess) => {
+      (day?.[sess] || []).forEach((b) => {
+        if (!b.isHeader) {
+          exercises += 1;
+          meters += parseMeters(b.metros);
+        }
+      });
+    });
+  });
+  return { days, exercises, meters };
+}
+
+function hasBlockingActiveSession() {
+  return S.activeSession?.status === 'active' && (S.activeSession.running || hasSplits(S.activeSession));
+}
+
+function triggerPlanImport() {
+  if (hasBlockingActiveSession()) {
+    toast('Termine ou descarte a sessão ativa antes de substituir o plano.');
+    return;
+  }
+  closeModal();
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.xlsx,.xls';
+  input.style.display = 'none';
+  input.addEventListener('change', loadXlsx);
+  document.body.appendChild(input);
+  input.click();
+  setTimeout(() => input.remove(), 30000);
+}
+
+function showPlanManager() {
+  const st = planStats();
+  const hasPlan = st.days > 0;
+  const activeWarning = hasBlockingActiveSession()
+    ? '<div class="info-bar" style="margin-top:10px;color:#e74c3c;border-color:#4a1818;background:#2a0808;">⚠️ Existe uma sessão Live ativa com tempos. Termine ou descarte a sessão antes de limpar/substituir o plano.</div>'
+    : '';
+
+  showModal('Gerir plano',
+    `<div class="plan-summary">
+      <div><span>Plano atual</span><strong>${hasPlan ? esc(S.weekLabel || 'Plano carregado') : 'Nenhum plano carregado'}</strong></div>
+      <div><span>Dias</span><strong>${st.days}</strong></div>
+      <div><span>Exercícios</span><strong>${st.exercises}</strong></div>
+      <div><span>Metros</span><strong>${st.meters}</strong></div>
+    </div>
+    <div style="font-size:12px;color:#6b85a8;line-height:1.5;margin-top:10px;">
+      <strong>Limpar plano atual</strong> remove o plano, zonas planeadas/registadas e exercício selecionado. Mantém atletas e resultados.
+    </div>
+    ${activeWarning}`,
+    [
+      { label: 'Carregar/substituir plano', cls: 'btn-primary', fn: triggerPlanImport },
+      { label: 'Limpar plano atual', cls: 'btn-secondary', fn: showClearPlanConfirm },
+      { label: 'Apagar todos os dados', cls: 'btn-danger', fn: showClearAllConfirm },
+      { label: 'Cancelar', cls: 'btn-secondary', fn: closeModal },
+    ]);
+}
+
+function showClearPlanConfirm() {
+  if (hasBlockingActiveSession()) {
+    toast('Termine ou descarte a sessão ativa antes de limpar o plano.');
+    return;
+  }
+  const st = planStats();
+  if (!st.days) {
+    toast('Não existe plano para limpar.');
+    closeModal();
+    return;
+  }
+  showModal('Limpar plano atual',
+    `<div style="font-size:13px;color:#6b85a8;line-height:1.5;">
+      Isto remove apenas os dados ligados ao plano atual: plano semanal, zonas planeadas/registadas, exercício selecionado e sessão Live ativa sem tempos.
+      <br><br><strong style="color:#a8c0e0;">Atletas e resultados guardados serão mantidos.</strong>
+    </div>`,
+    [
+      { label: 'Limpar plano', cls: 'btn-danger', fn: clearCurrentPlan },
+      { label: 'Cancelar', cls: 'btn-secondary', fn: showPlanManager },
+    ]);
+}
+
+function clearCurrentPlan() {
+  if (hasBlockingActiveSession()) {
+    toast('Termine ou descarte a sessão ativa antes de limpar o plano.');
+    return;
+  }
+  S.weekPlan = {};
+  S.zonePlan = {};
+  S.zoneLog = {};
+  S.weekLabel = '';
+  S.selectedExerciseId = '';
+  S.selectedExercise = null;
+  S.activeSession = null;
+  S.liveSplitDistance = 25;
+  saveState();
+  closeModal();
+  renderTab();
+  toast('Plano atual limpo. Atletas e resultados foram mantidos.');
+}
+
+function showClearAllConfirm() {
+  showModal('Apagar todos os dados',
+    `<div style="font-size:13px;color:#6b85a8;line-height:1.5;">
+      Isto remove <strong style="color:#e74c3c;">planos, atletas, resultados, zonas e sessões</strong>. Esta ação não pode ser anulada.
+      <br><br>Escreva <strong style="color:#a8c0e0;">APAGAR</strong> para confirmar.
+    </div>
+    <input class="inp" id="wipeConfirm" autocomplete="off" placeholder="Escreva APAGAR" style="margin-top:12px;">`,
+    [
+      { label: 'Apagar tudo', cls: 'btn-danger', fn: clearAllData },
+      { label: 'Cancelar', cls: 'btn-secondary', fn: showPlanManager },
+    ]);
+}
+
+function clearAllData() {
+  const txt = $('wipeConfirm')?.value?.trim().toUpperCase();
+  if (txt !== 'APAGAR') {
+    toast('Confirmação incorreta. Escreva APAGAR.');
+    return;
+  }
+  if (S.activeSession?.running) {
+    clearInterval(S.activeSession.iv);
+    releaseWakeLock();
+  }
+  S = defaultState();
+  try {
+    localStorage.removeItem(STORE_KEY);
+    OLD_STORE_KEYS.forEach((key) => localStorage.removeItem(key));
+  } catch (_) {}
+  saveState();
+  closeModal();
+  syncSessionButtons();
+  renderTab();
+  toast('Todos os dados foram apagados.');
+}
+
+// ============================================================
 // XLSX PARSER
 // ============================================================
 function loadXlsx(e) {
@@ -527,6 +675,7 @@ function loadXlsx(e) {
       const ws = wb.Sheets[wb.SheetNames[0]];
       const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: true });
       const parsed = parseWeekRows(rows);
+      parsed.filename = file.name;
       showLoadModal(parsed, file.name);
     } catch (err) {
       console.error(err);
@@ -669,7 +818,9 @@ function applyPlan(parsed, merge) {
     S.selectedExerciseId = '';
     S.selectedExercise = null;
     S.activeSession = null;
+    S.weekLabel = String(parsed.filename || '').replace(/\.[^.]+$/, '') || 'Plano carregado';
   }
+  if (merge && parsed.filename && !S.weekLabel) S.weekLabel = String(parsed.filename).replace(/\.[^.]+$/, '');
   saveState();
   closeModal();
   renderTab();
@@ -1132,7 +1283,7 @@ function renderLive() {
       ${dayTabsHTML()}
       <div class="live-left-head">
         <div><strong>${esc(DIAS[S.dayIdx])} — ${S.sessao === 'manha' ? 'Manhã' : 'Tarde'}</strong>${piscina ? `<span class="tag">${esc(piscina)}</span>` : ''}</div>
-        <span>${totalP}m</span>
+        <div style="display:flex;align-items:center;gap:8px;"><span>${totalP}m</span><button class="btn btn-secondary btn-sm" onclick="showPlanManager()">Gerir plano</button></div>
       </div>
       ${renderExerciseSections(S.dayIdx, S.sessao, { goLive: true })}
     </aside>

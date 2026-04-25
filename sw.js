@@ -1,4 +1,4 @@
-const CACHE = 'swimcoach-v4-live';
+const CACHE = 'swimcoach-v5-plan-management';
 const ASSETS = [
   './',
   './index.html',

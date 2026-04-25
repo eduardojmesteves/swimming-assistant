@@ -203,3 +203,11 @@ select{cursor:pointer}
   .live-left{position:static;max-height:none;overflow:visible;padding-right:0}
   .live-split-row{grid-template-columns:1fr 74px 74px 60px 24px}
 }
+
+/* ===== PLAN MANAGEMENT ===== */
+.plan-summary{display:grid;grid-template-columns:1.4fr repeat(3,.7fr);gap:8px;background:#08182d;border:1px solid #1e3358;border-radius:12px;padding:10px}
+.plan-summary div{min-width:0;border-right:1px solid #1e3358;padding-right:8px}
+.plan-summary div:last-child{border-right:none;padding-right:0}
+.plan-summary span{display:block;font-size:10px;font-weight:800;color:#4a6490;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px}
+.plan-summary strong{display:block;font-size:13px;color:#d8e7ff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media (max-width: 720px){.plan-summary{grid-template-columns:1fr 1fr}.plan-summary div{border-right:none}}
