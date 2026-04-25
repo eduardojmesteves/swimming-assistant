@@ -1,13 +1,13 @@
 // ============================================================
 // SwimCoach PWA — app.js
-// Cleaned project version: fixed parser, stopwatch targets, safer rendering
+// Live Training build: exact exercise selection + group-start timing
 // ============================================================
 
 const ZONAS = ['TT', 'A1', 'A2', 'A3', 'M.AER', 'LAN', 'M.ANA', 'VEL', 'PML', 'TL'];
 const DIAS = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo'];
 const DIAS_SHORT = ['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb', 'Dom'];
-const STORE_KEY = 'swim_coach_v3';
-const OLD_STORE_KEYS = ['swim_coach_v2', 'swimcoach_v2'];
+const STORE_KEY = 'swim_coach_v4_live';
+const OLD_STORE_KEYS = ['swim_coach_v3', 'swim_coach_v2', 'swimcoach_v2'];
 
 const COL = {
   day: 0,
@@ -23,18 +23,18 @@ const COL = {
 };
 
 const DAY_MAP = {
-  'SEGUNDA': 0,
+  SEGUNDA: 0,
   'SEGUNDA-FEIRA': 0,
-  'TERCA': 1,
+  TERCA: 1,
   'TERCA-FEIRA': 1,
-  'QUARTA': 2,
+  QUARTA: 2,
   'QUARTA-FEIRA': 2,
-  'QUINTA': 3,
+  QUINTA: 3,
   'QUINTA-FEIRA': 3,
-  'SEXTA': 4,
+  SEXTA: 4,
   'SEXTA-FEIRA': 4,
-  'SABADO': 5,
-  'DOMINGO': 6,
+  SABADO: 5,
+  DOMINGO: 6,
 };
 
 const HEADER_NAMES = ['AQUECIMENTO', 'TAREFA', 'RECUPERACAO', 'FOLGA'];
@@ -53,9 +53,11 @@ function defaultState() {
     athletes: [],
     results: [],
     zoneLog: {},
-    cronoAthleteId: '',
-    cronoBlockIdx: '0',
-    sw: { running: false, start: 0, elapsed: 0, splits: [], lastSplit: 0, iv: null },
+    selectedExerciseId: '',
+    selectedExercise: null,
+    activeAthleteId: '',
+    liveSplitDistance: 25,
+    activeSession: null,
   };
 }
 
@@ -141,6 +143,27 @@ function initials(name) {
     .join('') || '?';
 }
 
+function uid(prefix = 'id') {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function hasSplits(session = S.activeSession) {
+  if (!session?.splitsByAthlete) return false;
+  return Object.values(session.splitsByAthlete).some((arr) => Array.isArray(arr) && arr.length);
+}
+
+function totalSplitCount(session = S.activeSession) {
+  if (!session?.splitsByAthlete) return 0;
+  return Object.values(session.splitsByAthlete).reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0);
+}
+
+function safeSessionForSave(session) {
+  if (!session) return null;
+  const copy = { ...session };
+  delete copy.iv;
+  return copy;
+}
+
 function loadState() {
   for (const key of [STORE_KEY, ...OLD_STORE_KEYS]) {
     try {
@@ -154,6 +177,11 @@ function loadState() {
         zoneLog: d.zoneLog || {},
         weekPlan: d.weekPlan || {},
         zonePlan: d.zonePlan || {},
+        selectedExerciseId: d.selectedExerciseId || '',
+        selectedExercise: d.selectedExercise || null,
+        activeAthleteId: d.activeAthleteId || d.cronoAthleteId || '',
+        liveSplitDistance: Number(d.liveSplitDistance) || 25,
+        activeSession: d.activeSession || null,
       };
       return;
     } catch (err) {
@@ -170,6 +198,11 @@ function saveState() {
       zoneLog: S.zoneLog,
       weekPlan: S.weekPlan,
       zonePlan: S.zonePlan,
+      selectedExerciseId: S.selectedExerciseId,
+      selectedExercise: S.selectedExercise,
+      activeAthleteId: S.activeAthleteId,
+      liveSplitDistance: S.liveSplitDistance,
+      activeSession: safeSessionForSave(S.activeSession),
     }));
   } catch (err) {
     console.warn('Save failed:', err);
@@ -184,6 +217,7 @@ window.addEventListener('load', () => {
   loadState();
   const d = new Date();
   $('hdrSub').textContent = d.toLocaleDateString('pt-PT', { weekday: 'long', day: 'numeric', month: 'long' });
+  if (!S.activeAthleteId && S.athletes[0]) S.activeAthleteId = String(S.athletes[0].id);
   syncSessionButtons();
   renderTab();
 
@@ -200,8 +234,11 @@ function showTab(t) {
 }
 
 function setSessao(s) {
+  if (S.activeSession?.status === 'active' && S.activeSession.running) {
+    toast('Cronómetro ativo: pause ou termine antes de mudar sessão.');
+    return;
+  }
   S.sessao = s;
-  S.cronoBlockIdx = '0';
   syncSessionButtons();
   renderTab();
 }
@@ -212,8 +249,11 @@ function syncSessionButtons() {
 }
 
 function setDay(i) {
+  if (S.activeSession?.status === 'active' && S.activeSession.running) {
+    toast('Cronómetro ativo: pause ou termine antes de mudar dia.');
+    return;
+  }
   S.dayIdx = i;
-  S.cronoBlockIdx = '0';
   renderTab();
 }
 
@@ -221,14 +261,15 @@ function renderTab() {
   const c = $('content');
   if (!c) return;
   if (S.tab === 'plano') c.innerHTML = renderPlano();
+  else if (S.tab === 'live') c.innerHTML = renderLive();
   else if (S.tab === 'cronometro') c.innerHTML = renderCrono();
   else if (S.tab === 'zonas') c.innerHTML = renderZonas();
   else if (S.tab === 'atletas') c.innerHTML = renderAtletas();
   else if (S.tab === 'resultados') c.innerHTML = renderResultados();
 
-  if (S.tab === 'cronometro' && S.sw.running) {
-    clearInterval(S.sw.iv);
-    S.sw.iv = setInterval(updateSWDisplay, 37);
+  if ((S.tab === 'live' || S.tab === 'cronometro') && S.activeSession?.running) {
+    clearInterval(S.activeSession.iv);
+    S.activeSession.iv = setInterval(updateSWDisplay, 37);
   }
 }
 
@@ -243,8 +284,204 @@ function dayTabsHTML() {
 }
 
 // ============================================================
+// EXERCISE SELECTION
+// ============================================================
+function getBlocks(dayIdx = S.dayIdx, sess = S.sessao) {
+  return (S.weekPlan[dayIdx] || {})[sess] || [];
+}
+
+function getPool(dayIdx = S.dayIdx) {
+  return (S.weekPlan[dayIdx] || {}).piscina || '';
+}
+
+function getExerciseEntries(dayIdx = S.dayIdx, sess = S.sessao) {
+  const blocks = getBlocks(dayIdx, sess);
+  const entries = [];
+  let blockName = 'Sem bloco';
+  let blockTipo = 'tarefa';
+  blocks.forEach((b, idx) => {
+    if (b.isHeader) {
+      blockName = b.nome || 'Bloco';
+      blockTipo = b.tipo || 'tarefa';
+    } else {
+      entries.push({
+        id: `${dayIdx}_${sess}_${idx}`,
+        dayIdx,
+        sess,
+        idx,
+        ex: b,
+        blockName,
+        blockTipo,
+      });
+    }
+  });
+  return entries;
+}
+
+function buildExerciseSnapshot(dayIdx, sess, idx) {
+  const entry = getExerciseEntries(dayIdx, sess).find((e) => e.idx === Number(idx));
+  if (!entry) return null;
+  const ex = entry.ex;
+  return {
+    id: entry.id,
+    dayIdx,
+    sess,
+    day: DIAS[dayIdx],
+    sessionLabel: sess === 'manha' ? 'Manhã' : 'Tarde',
+    blockName: entry.blockName,
+    blockTipo: entry.blockTipo,
+    index: Number(idx),
+    zona: ex.zona || '',
+    desc: ex.desc || '',
+    metros: parseMeters(ex.metros),
+    ciclo: ex.ciclo || '',
+    target: ex.target || '',
+    pool: getPool(dayIdx),
+  };
+}
+
+function getSelectedExercise() {
+  if (!S.selectedExerciseId) return null;
+  const parts = S.selectedExerciseId.split('_');
+  if (parts.length >= 3) {
+    const idx = Number(parts[2]);
+    const fresh = buildExerciseSnapshot(Number(parts[0]), parts[1], idx);
+    if (fresh) {
+      S.selectedExercise = fresh;
+      return fresh;
+    }
+  }
+  return S.selectedExercise || null;
+}
+
+function defaultSplitDistance(pool) {
+  return String(pool || '').toUpperCase().includes('50') ? 50 : 25;
+}
+
+function selectExerciseByIndex(dayIdx, sess, idx, goLive = false) {
+  const snap = buildExerciseSnapshot(dayIdx, sess, idx);
+  if (!snap) {
+    toast('Exercício não encontrado.');
+    return;
+  }
+
+  if (S.activeSession?.status === 'active' && S.activeSession.exerciseSnapshot?.id !== snap.id && (S.activeSession.running || hasSplits(S.activeSession))) {
+    showModal('Sessão ativa em curso',
+      '<div style="font-size:13px;color:#6b85a8;line-height:1.5;">Já existe uma cronometragem ativa. Termine ou descarte essa sessão antes de escolher outro exercício. Isto evita misturar tempos em exercícios errados.</div>',
+      [
+        { label: 'Ir para Live', cls: 'btn-primary', fn: () => { closeModal(); showTab('live'); } },
+        { label: 'Cancelar', cls: 'btn-secondary', fn: closeModal },
+      ]);
+    return;
+  }
+
+  S.dayIdx = dayIdx;
+  S.sessao = sess;
+  S.selectedExerciseId = snap.id;
+  S.selectedExercise = snap;
+  if (!S.activeSession || S.activeSession.status === 'finished' || S.activeSession.exerciseSnapshot?.id !== snap.id) {
+    S.liveSplitDistance = defaultSplitDistance(snap.pool);
+  }
+  syncSessionButtons();
+  saveState();
+  toast('Exercício selecionado.');
+  if (goLive) S.tab = 'live';
+  renderTab();
+}
+
+function selectedExerciseBannerHTML() {
+  const ex = getTimingExercise();
+  if (!ex) {
+    return `<div class="selected-banner muted"><strong>Nenhum exercício selecionado.</strong> Toque numa linha do plano para cronometrar.</div>`;
+  }
+  return `<div class="selected-banner">
+    <div>
+      <div class="selected-kicker">Exercício selecionado</div>
+      <div class="selected-main">${esc(ex.blockName)} — ${esc(ex.zona || '—')} · ${esc(ex.desc || '—')}</div>
+      <div class="selected-meta">${esc(ex.day)} · ${esc(ex.sessionLabel)} · ${esc(ex.pool || 'Piscina?')} · ${ex.metros ? `${ex.metros}m` : 'metros?'}${ex.ciclo ? ` · ${esc(ex.ciclo)}` : ''}${ex.target ? ` · Alvo ${esc(ex.target)}` : ''}</div>
+    </div>
+    <button class="btn btn-secondary btn-sm" onclick="showTab('live')">Live</button>
+  </div>`;
+}
+
+function getTimingExercise() {
+  if (S.activeSession?.status === 'active' || S.activeSession?.status === 'finished') return S.activeSession.exerciseSnapshot;
+  return getSelectedExercise();
+}
+
+function exercisePattern(snapshot) {
+  if (!snapshot) return null;
+  const txt = `${snapshot.desc || ''} ${snapshot.metros || ''}`;
+  const m = txt.match(/(\d{1,2})\s*(?:x|×)\s*(\d{2,4})/i);
+  if (m) {
+    const reps = Number(m[1]);
+    const repDistance = Number(m[2]);
+    if (reps > 0 && repDistance > 0) return { reps, repDistance, source: 'auto' };
+  }
+  const meters = parseMeters(snapshot.metros);
+  if (meters > 0) return { reps: 1, repDistance: meters, source: 'meters' };
+  return null;
+}
+
+function splitMeta(splitNo, splitDistance, snapshot) {
+  const pattern = exercisePattern(snapshot);
+  const totalDistance = splitNo * splitDistance;
+  if (!pattern) return { label: `${totalDistance}m`, repetition: '', distanceMarker: totalDistance, totalDistance };
+  const repetition = Math.floor((totalDistance - 1) / pattern.repDistance) + 1;
+  const distanceMarker = ((totalDistance - 1) % pattern.repDistance) + 1;
+  const label = pattern.reps > 1 ? `Rep ${repetition} — ${distanceMarker}m` : `${distanceMarker}m`;
+  return { label, repetition, distanceMarker, totalDistance, repDistance: pattern.repDistance, reps: pattern.reps };
+}
+
+// ============================================================
 // PLANO
 // ============================================================
+function renderExerciseSections(dayIdx, sess, opts = {}) {
+  const blocks = getBlocks(dayIdx, sess);
+  if (!blocks.length) {
+    return `<div class="empty-state">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 8h10M7 12h6"/></svg>
+      <div>Sem blocos para este dia/sessão.</div>
+      <div style="margin-top:4px;">Carregue o Excel ou adicione manualmente.</div>
+    </div>`;
+  }
+
+  let html = '';
+  let open = false;
+  let blockName = 'Sem bloco';
+  blocks.forEach((b, idx) => {
+    if (b.isHeader) {
+      if (open) html += '</div></div>';
+      blockName = b.nome || 'Bloco';
+      const tipo = b.tipo || 'tarefa';
+      const meters = parseMeters(b.metros);
+      html += `<div class="block-section"><div class="block-header ${esc(tipo)}"><span>${esc(blockName)}</span>${meters ? `<span style="font-size:11px;opacity:.7;">${meters}m</span>` : ''}</div><div class="block-body">`;
+      open = true;
+      return;
+    }
+
+    if (!open) {
+      html += '<div class="block-section"><div class="block-body">';
+      open = true;
+    }
+
+    const snap = buildExerciseSnapshot(dayIdx, sess, idx);
+    const selected = snap && S.selectedExerciseId === snap.id;
+    const locked = S.activeSession?.status === 'active' && S.activeSession.exerciseSnapshot?.id === snap?.id;
+    html += `<button class="ex-row ex-clickable${b.target ? ' has-target' : ''}${selected ? ' selected' : ''}${locked ? ' locked' : ''}" onclick="selectExerciseByIndex(${dayIdx}, '${sess}', ${idx}, ${opts.goLive ? 'true' : 'false'})">
+      <span class="zbadge z-${zkey(b.zona)}">${esc(b.zona || '—')}</span>
+      <span>
+        <span style="color:#c8d8f0;line-height:1.4;display:block;">${esc(b.desc || '—')}</span>
+        ${b.ciclo ? `<span style="font-size:11px;color:#4a6490;margin-top:2px;display:block;">${esc(b.ciclo)}</span>` : ''}
+        ${b.target ? `<span style="font-size:11px;color:#f0a500;margin-top:2px;display:block;">Alvo: ${esc(b.target)}</span>` : ''}
+      </span>
+      <span style="text-align:right;color:#4a6490;font-size:12px;">${parseMeters(b.metros) || ''}</span>
+    </button>`;
+  });
+  if (open) html += '</div></div>';
+  return html;
+}
+
 function renderPlano() {
   const day = S.weekPlan[S.dayIdx] || {};
   const blocks = day[S.sessao] || [];
@@ -252,6 +489,7 @@ function renderPlano() {
   const piscina = day.piscina || '';
 
   let html = dayTabsHTML();
+  html += selectedExerciseBannerHTML();
   html += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:8px;">
     <div>
       <span style="font-size:15px;font-weight:700;color:#a8c0e0;">${esc(DIAS[S.dayIdx])} — ${S.sessao === 'manha' ? 'Manhã' : 'Tarde'}</span>
@@ -269,48 +507,7 @@ function renderPlano() {
     </label>
   </div>`;
 
-  if (!blocks.length) {
-    html += `<div class="empty-state">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 8h10M7 12h6"/></svg>
-      <div>Sem blocos para este dia/sessão.</div>
-      <div style="margin-top:4px;">Carregue o Excel ou adicione manualmente.</div>
-    </div>`;
-  } else {
-    let sections = [];
-    let cur = null;
-    blocks.forEach((b) => {
-      if (b.isHeader) {
-        if (cur) sections.push(cur);
-        cur = { header: b, items: [] };
-      } else {
-        if (!cur) cur = { header: null, items: [] };
-        cur.items.push(b);
-      }
-    });
-    if (cur) sections.push(cur);
-
-    html += sections.map((sec) => {
-      const hdr = sec.header;
-      const tipo = hdr ? hdr.tipo : 'tarefa';
-      const nome = hdr ? (hdr.nome || 'Bloco') : 'Bloco';
-      const hdMetros = hdr ? parseMeters(hdr.metros) : 0;
-      return `<div class="block-section">
-        ${hdr ? `<div class="block-header ${esc(tipo)}"><span>${esc(nome)}</span>${hdMetros ? `<span style="font-size:11px;opacity:.7;">${hdMetros}m</span>` : ''}</div>` : ''}
-        <div class="block-body">
-          ${sec.items.map((ex) => `<div class="ex-row${ex.target ? ' has-target' : ''}">
-            <span class="zbadge z-${zkey(ex.zona)}">${esc(ex.zona || '—')}</span>
-            <div>
-              <div style="color:#c8d8f0;line-height:1.4;">${esc(ex.desc || '—')}</div>
-              ${ex.ciclo ? `<div style="font-size:11px;color:#4a6490;margin-top:2px;">${esc(ex.ciclo)}</div>` : ''}
-              ${ex.target ? `<div style="font-size:11px;color:#f0a500;margin-top:2px;">Alvo: ${esc(ex.target)}</div>` : ''}
-            </div>
-            <div style="text-align:right;color:#4a6490;font-size:12px;">${parseMeters(ex.metros) || ''}</div>
-          </div>`).join('')}
-        </div>
-      </div>`;
-    }).join('');
-  }
-
+  html += renderExerciseSections(S.dayIdx, S.sessao, { goLive: false });
   html += `<button class="btn btn-secondary" style="width:100%;margin-top:6px;" onclick="showAddBlockModal()">+ Adicionar bloco manualmente</button>`;
   return html;
 }
@@ -461,9 +658,17 @@ function applyPlan(parsed, merge) {
       ZONAS.forEach((z) => { S.zonePlan[k][z] = (S.zonePlan[k][z] || 0) + (parsed.zonePl[k][z] || 0); });
     });
   } else {
+    if (S.activeSession?.status === 'active' && (S.activeSession.running || hasSplits(S.activeSession))) {
+      toast('Termine a sessão ativa antes de substituir o plano.');
+      closeModal();
+      return;
+    }
     S.weekPlan = parsed.plan;
     S.zonePlan = parsed.zonePl;
     S.zoneLog = {};
+    S.selectedExerciseId = '';
+    S.selectedExercise = null;
+    S.activeSession = null;
   }
   saveState();
   closeModal();
@@ -487,7 +692,7 @@ function showAddBlockModal() {
     <div class="form-row">
       <input class="inp" id="mMetros" type="number" placeholder="Metros" style="flex:1;">
       <input class="inp" id="mCiclo" placeholder="Ciclo (ex: cd 1'45)" style="flex:1;">
-      <input class="inp" id="mTarget" placeholder="Tempo alvo" style="flex:1;">
+      <input class="inp" id="mTarget" placeholder="Tempo alvo total" style="flex:1;">
     </div>`,
     [
       { label: 'Adicionar bloco', cls: 'btn-primary', fn: saveBlockModal },
@@ -533,101 +738,80 @@ function saveBlockModal() {
 }
 
 // ============================================================
-// CRONÓMETRO
+// LIVE TRAINING / CRONÓMETRO
 // ============================================================
-function namedBlocks() {
-  const blocks = (S.weekPlan[S.dayIdx] || {})[S.sessao] || [];
-  const named = [];
-  for (let i = 0; i < blocks.length; i++) {
-    const b = blocks[i];
-    if (b.isHeader && b.nome && b.nome !== 'Folga') {
-      let end = blocks.length;
-      for (let j = i + 1; j < blocks.length; j++) {
-        if (blocks[j].isHeader) { end = j; break; }
-      }
-      named.push({ header: b, start: i, end, blocks });
-    }
+function currentSplitDistance() {
+  if (S.activeSession?.status === 'active' || S.activeSession?.status === 'finished') return Number(S.activeSession.splitDistance) || 25;
+  const ex = getSelectedExercise();
+  return Number(S.liveSplitDistance) || defaultSplitDistance(ex?.pool);
+}
+
+function setSplitDistance(value) {
+  const dist = Number(value);
+  if (![25, 50].includes(dist)) return;
+  if (S.activeSession?.status === 'active' && hasSplits(S.activeSession)) {
+    toast('A distância do parcial fica bloqueada após o primeiro parcial.');
+    renderTab();
+    return;
   }
-  return named;
-}
-
-function targetForBlock(idx) {
-  const item = namedBlocks()[Number(idx) || 0];
-  if (!item) return '';
-  if (item.header.target) return item.header.target;
-  for (let i = item.start + 1; i < item.end; i++) {
-    if (item.blocks[i]?.target) return item.blocks[i].target;
-  }
-  return '';
-}
-
-function setCronoAthlete(value) {
-  S.cronoAthleteId = value;
-}
-
-function setCronoBlock(value) {
-  S.cronoBlockIdx = value;
+  S.liveSplitDistance = dist;
+  if (S.activeSession?.status === 'active') S.activeSession.splitDistance = dist;
+  saveState();
   renderTab();
 }
 
-function renderCrono() {
-  const sw = S.sw;
-  const elapsed = sw.running ? sw.elapsed + (Date.now() - sw.start) : sw.elapsed;
-  const currentAthleteId = S.cronoAthleteId || (S.athletes[0]?.id ? String(S.athletes[0].id) : '');
-  S.cronoAthleteId = currentAthleteId;
+function setActiveAthlete(id) {
+  S.activeAthleteId = String(id || '');
+  if (S.activeSession?.status === 'active') S.activeSession.activeAthleteId = S.activeAthleteId;
+  saveState();
+  renderTab();
+}
 
-  const athleteOpts = S.athletes.length
-    ? S.athletes.map((a) => `<option value="${esc(a.id)}" ${String(a.id) === String(currentAthleteId) ? 'selected' : ''}>${esc(a.nome)}</option>`).join('')
-    : '<option value="">— Adicione atletas —</option>';
+function createLiveSession(snapshot) {
+  const splitDistance = Number(S.liveSplitDistance) || defaultSplitDistance(snapshot.pool);
+  return {
+    id: uid('session'),
+    status: 'active',
+    date: new Date().toLocaleDateString('pt-PT'),
+    createdAt: new Date().toISOString(),
+    exerciseId: snapshot.id,
+    exerciseSnapshot: snapshot,
+    pool: snapshot.pool,
+    splitDistance,
+    running: false,
+    start: 0,
+    elapsed: 0,
+    splitsByAthlete: {},
+    history: [],
+    activeAthleteId: S.activeAthleteId || '',
+  };
+}
 
-  const blocks = namedBlocks();
-  if (Number(S.cronoBlockIdx) >= blocks.length) S.cronoBlockIdx = '0';
-  const blockOpts = blocks.length
-    ? blocks.map((b, i) => `<option value="${i}" ${String(i) === String(S.cronoBlockIdx) ? 'selected' : ''}>${esc(b.header.nome || `Bloco ${i + 1}`)}</option>`).join('')
-    : '<option value="">— Sem blocos —</option>';
-
-  const target = targetForBlock(S.cronoBlockIdx);
-  const targetMs = parseTargetTime(target);
-  const splits = sw.splits;
-  const avg = splits.length ? splits.reduce((a, s) => a + s.lap, 0) / splits.length : 0;
-
-  let html = dayTabsHTML();
-  html += `<div class="form-row" style="margin-bottom:10px;">
-    <div style="flex:1;"><div class="section-label">Atleta</div><select class="sel" id="cAtleta" onchange="setCronoAthlete(this.value)">${athleteOpts}</select></div>
-    <div style="flex:1;"><div class="section-label">Bloco</div><select class="sel" id="cBloco" onchange="setCronoBlock(this.value)">${blockOpts}</select></div>
-  </div>`;
-
-  html += `<div class="card">
-    <div class="sw-display" id="swDisp">${fmtTime(elapsed)}</div>
-    <div class="sw-info" id="swInfo">${splits.length ? `${splits.length} parcial${splits.length !== 1 ? 'is' : ''}` : 'Sem parciais'}${target ? ` · Alvo ${esc(target)}` : ''}</div>
-    <div class="sw-controls">
-      <button class="sw-btn start" id="btnSS" onclick="toggleSW()">${sw.running ? 'Parar' : sw.elapsed > 0 ? 'Retomar' : 'Iniciar'}</button>
-      <button class="sw-btn split" id="btnSplit" onclick="takeSplit()" ${!sw.running ? 'disabled' : ''}>Parcial</button>
-      <button class="sw-btn reset" onclick="resetSW()">Reset</button>
-    </div>
-  </div>`;
-
-  if (splits.length) {
-    html += `<div class="card"><div class="card-title">Parciais</div>
-      ${splits.map((s, i) => {
-        const dAvg = s.lap - avg;
-        const avgTxt = (dAvg >= 0 ? '+' : '') + fmtTime(Math.abs(dAvg));
-        const targetDiff = targetMs ? s.lap - targetMs : 0;
-        const targetTxt = targetMs ? `${targetDiff >= 0 ? '+' : ''}${fmtTime(Math.abs(targetDiff))}` : '';
-        const cls = i === 0 ? '' : dAvg > 0 ? 'lap-slow' : 'lap-fast';
-        return `<div class="split-row" style="grid-template-columns:32px 80px 80px 1fr ${targetMs ? '70px' : ''};">
-          <span class="split-num">#${i + 1}</span>
-          <span style="font-weight:600;color:#a8c0e0;">${fmtTime(s.cum)}</span>
-          <span style="color:#6b85a8;">${fmtTime(s.lap)}</span>
-          <span class="${cls}">${i > 0 ? avgTxt : '—'}</span>
-          ${targetMs ? `<span class="target-compare ${targetDiff > 0 ? 'tc-over' : 'tc-good'}">${targetTxt}</span>` : ''}
-        </div>`;
-      }).join('')}
-    </div>`;
+function ensureLiveSession() {
+  const snapshot = getSelectedExercise();
+  if (!snapshot) {
+    toast('Selecione primeiro um exercício no plano.');
+    return null;
   }
+  if (!S.activeSession || S.activeSession.status === 'finished') {
+    S.activeSession = createLiveSession(snapshot);
+    saveState();
+    return S.activeSession;
+  }
+  if (S.activeSession.exerciseSnapshot?.id !== snapshot.id) {
+    if (S.activeSession.running || hasSplits(S.activeSession)) {
+      toast('Existe uma sessão ativa para outro exercício. Termine-a primeiro.');
+      return null;
+    }
+    S.activeSession = createLiveSession(snapshot);
+    saveState();
+  }
+  return S.activeSession;
+}
 
-  html += `<button class="btn btn-success" style="width:100%;margin-top:6px;" onclick="saveSplits()">Guardar parciais para este atleta</button>`;
-  return html;
+function getLiveElapsed(session = S.activeSession) {
+  if (!session) return 0;
+  return session.elapsed + (session.running ? Date.now() - session.start : 0);
 }
 
 async function requestWakeLock() {
@@ -643,67 +827,323 @@ async function releaseWakeLock() {
   wakeLock = null;
 }
 
-function toggleSW() {
-  const sw = S.sw;
-  if (sw.running) {
-    clearInterval(sw.iv);
-    sw.elapsed += Date.now() - sw.start;
-    sw.running = false;
+function toggleLiveSW() {
+  const session = ensureLiveSession();
+  if (!session) return;
+  if (session.running) {
+    clearInterval(session.iv);
+    session.elapsed += Date.now() - session.start;
+    session.running = false;
     releaseWakeLock();
   } else {
-    sw.start = Date.now();
-    sw.running = true;
-    sw.iv = setInterval(updateSWDisplay, 37);
+    session.start = Date.now();
+    session.running = true;
+    session.status = 'active';
+    session.iv = setInterval(updateSWDisplay, 37);
     requestWakeLock();
   }
+  saveState();
   renderTab();
 }
 
 function updateSWDisplay() {
   const el = $('swDisp');
-  if (el && S.sw.running) el.textContent = fmtTime(S.sw.elapsed + (Date.now() - S.sw.start));
+  if (el && S.activeSession?.running) el.textContent = fmtTime(getLiveElapsed());
 }
 
-function takeSplit() {
-  const sw = S.sw;
-  if (!sw.running) return;
-  const now = sw.elapsed + (Date.now() - sw.start);
-  sw.splits.push({ cum: now, lap: now - sw.lastSplit });
-  sw.lastSplit = now;
-  renderTab();
+function nextSplitInfoForAthlete(athleteId) {
+  const session = S.activeSession;
+  const snapshot = getTimingExercise();
+  const list = session?.splitsByAthlete?.[athleteId] || [];
+  return splitMeta(list.length + 1, currentSplitDistance(), snapshot);
 }
 
-function resetSW() {
-  clearInterval(S.sw.iv);
-  S.sw = { running: false, start: 0, elapsed: 0, splits: [], lastSplit: 0, iv: null };
-  releaseWakeLock();
-  renderTab();
-}
+function takeLiveSplit() {
+  const session = ensureLiveSession();
+  if (!session) return;
+  if (!session.running) {
+    toast('Inicie o cronómetro antes de registar parciais.');
+    return;
+  }
+  const athlete = S.athletes.find((a) => String(a.id) === String(S.activeAthleteId));
+  if (!athlete) {
+    toast('Selecione um atleta antes de registar o parcial.');
+    return;
+  }
 
-function saveSplits() {
-  const sw = S.sw;
-  if (!sw.splits.length) { toast('Sem parciais para guardar.'); return; }
-
-  const athlete = S.athletes.find((a) => String(a.id) === String(S.cronoAthleteId));
-  if (!athlete) { toast('Selecione um atleta.'); return; }
-
-  const block = namedBlocks()[Number(S.cronoBlockIdx) || 0];
-  const target = targetForBlock(S.cronoBlockIdx);
-
-  S.results.push({
-    id: Date.now(),
-    date: new Date().toLocaleDateString('pt-PT'),
-    dia: DIAS[S.dayIdx],
-    sessao: S.sessao,
-    athlete: athlete.nome,
-    bloco: block?.header?.nome || '—',
-    targetTime: target,
-    splits: sw.splits.map((s) => ({ cum: s.cum, lap: s.lap })),
-  });
-
+  const aid = String(athlete.id);
+  if (!session.splitsByAthlete[aid]) session.splitsByAthlete[aid] = [];
+  const list = session.splitsByAthlete[aid];
+  const cum = getLiveElapsed(session);
+  const prevCum = list.length ? list[list.length - 1].cum : 0;
+  const meta = splitMeta(list.length + 1, session.splitDistance, session.exerciseSnapshot);
+  const targetMs = parseTargetTime(session.exerciseSnapshot?.target);
+  const totalMeters = parseMeters(session.exerciseSnapshot?.metros);
+  const targetDiffMs = targetMs && totalMeters && meta.totalDistance >= totalMeters ? cum - targetMs : null;
+  const split = {
+    id: uid('split'),
+    athleteId: aid,
+    athleteName: athlete.nome,
+    splitNo: list.length + 1,
+    cum,
+    lap: cum - prevCum,
+    distanceMarker: meta.distanceMarker,
+    totalDistance: meta.totalDistance,
+    repetition: meta.repetition,
+    repDistance: meta.repDistance,
+    label: meta.label,
+    targetDiffMs,
+    createdAt: new Date().toISOString(),
+  };
+  list.push(split);
+  session.history.push({ athleteId: aid, splitId: split.id });
+  session.activeAthleteId = aid;
   saveState();
-  resetSW();
-  toast('Parciais guardados!');
+  renderTab();
+}
+
+function recomputeAthleteSplits(athleteId) {
+  const session = S.activeSession;
+  const list = session?.splitsByAthlete?.[athleteId];
+  if (!Array.isArray(list)) return;
+  const targetMs = parseTargetTime(session.exerciseSnapshot?.target);
+  const totalMeters = parseMeters(session.exerciseSnapshot?.metros);
+  list.sort((a, b) => a.cum - b.cum);
+  list.forEach((s, idx) => {
+    const meta = splitMeta(idx + 1, session.splitDistance, session.exerciseSnapshot);
+    const prevCum = idx ? list[idx - 1].cum : 0;
+    s.splitNo = idx + 1;
+    s.lap = s.cum - prevCum;
+    s.distanceMarker = meta.distanceMarker;
+    s.totalDistance = meta.totalDistance;
+    s.repetition = meta.repetition;
+    s.repDistance = meta.repDistance;
+    s.label = meta.label;
+    s.targetDiffMs = targetMs && totalMeters && meta.totalDistance >= totalMeters ? s.cum - targetMs : null;
+  });
+}
+
+function undoLastLiveSplit() {
+  const session = S.activeSession;
+  if (!session?.history?.length) {
+    toast('Sem parciais para anular.');
+    return;
+  }
+  const last = session.history.pop();
+  const list = session.splitsByAthlete[last.athleteId] || [];
+  session.splitsByAthlete[last.athleteId] = list.filter((s) => s.id !== last.splitId);
+  recomputeAthleteSplits(last.athleteId);
+  saveState();
+  renderTab();
+  toast('Último parcial anulado.');
+}
+
+function deleteLiveSplit(athleteId, splitId) {
+  const session = S.activeSession;
+  if (!session?.splitsByAthlete?.[athleteId]) return;
+  session.splitsByAthlete[athleteId] = session.splitsByAthlete[athleteId].filter((s) => s.id !== splitId);
+  session.history = (session.history || []).filter((h) => h.splitId !== splitId);
+  recomputeAthleteSplits(athleteId);
+  saveState();
+  renderTab();
+  toast('Parcial removido.');
+}
+
+function finishLiveSession() {
+  const session = S.activeSession;
+  if (!session || !hasSplits(session)) {
+    toast('Sem parciais para terminar.');
+    return;
+  }
+  if (session.running) {
+    session.elapsed += Date.now() - session.start;
+    session.running = false;
+    clearInterval(session.iv);
+    releaseWakeLock();
+  }
+  session.status = 'finished';
+  session.finishedAt = new Date().toISOString();
+
+  S.results = S.results.filter((r) => r.sessionId !== session.id);
+  Object.entries(session.splitsByAthlete).forEach(([athleteId, splits]) => {
+    if (!splits.length) return;
+    const athlete = S.athletes.find((a) => String(a.id) === String(athleteId));
+    const ex = session.exerciseSnapshot;
+    S.results.push({
+      id: uid('result'),
+      sessionId: session.id,
+      date: session.date || new Date().toLocaleDateString('pt-PT'),
+      dia: ex.day,
+      diaIdx: ex.dayIdx,
+      sessao: ex.sess,
+      athleteId,
+      athlete: athlete?.nome || splits[0]?.athleteName || 'Atleta',
+      bloco: ex.blockName || '—',
+      exerciseId: ex.id,
+      exerciseDesc: ex.desc || '',
+      zone: ex.zona || '',
+      meters: ex.metros || 0,
+      ciclo: ex.ciclo || '',
+      pool: ex.pool || '',
+      splitDistance: session.splitDistance,
+      targetTime: ex.target || '',
+      splits: splits.map((s) => ({
+        id: s.id,
+        splitNo: s.splitNo,
+        cum: s.cum,
+        lap: s.lap,
+        label: s.label,
+        repetition: s.repetition,
+        distanceMarker: s.distanceMarker,
+        totalDistance: s.totalDistance,
+        targetDiffMs: s.targetDiffMs,
+      })),
+    });
+  });
+  saveState();
+  renderTab();
+  toast('Sessão terminada e resultados guardados.');
+}
+
+function clearFinishedSession() {
+  if (S.activeSession?.running) {
+    toast('Pause o cronómetro primeiro.');
+    return;
+  }
+  S.activeSession = null;
+  saveState();
+  renderTab();
+}
+
+function discardActiveSession() {
+  const session = S.activeSession;
+  if (!session) return;
+  showModal('Descartar sessão',
+    '<div style="font-size:13px;color:#6b85a8;line-height:1.5;">Isto remove a sessão ativa do ecrã. Resultados já finalizados ficam guardados; parciais não terminados serão perdidos.</div>',
+    [
+      { label: 'Descartar', cls: 'btn-danger', fn: () => { if (S.activeSession?.running) releaseWakeLock(); S.activeSession = null; saveState(); closeModal(); renderTab(); } },
+      { label: 'Cancelar', cls: 'btn-secondary', fn: closeModal },
+    ]);
+}
+
+function renderAthleteChips() {
+  if (!S.athletes.length) return '<div class="info-bar">Adicione atletas antes de registar tempos.</div>';
+  if (!S.activeAthleteId) S.activeAthleteId = String(S.athletes[0].id);
+  return `<div class="athlete-chips">${S.athletes.map((a) => {
+    const active = String(a.id) === String(S.activeAthleteId);
+    const count = S.activeSession?.splitsByAthlete?.[String(a.id)]?.length || 0;
+    return `<button class="ath-chip${active ? ' active' : ''}" onclick="setActiveAthlete('${esc(a.id)}')">
+      <span class="ath-chip-avatar">${esc(initials(a.nome))}</span>
+      <span>${esc(a.nome)}</span>
+      ${count ? `<span class="ath-chip-count">${count}</span>` : ''}
+    </button>`;
+  }).join('')}</div>`;
+}
+
+function renderSplitDistanceSelector() {
+  const locked = S.activeSession?.status === 'active' && hasSplits(S.activeSession);
+  const dist = currentSplitDistance();
+  return `<div class="split-distance">
+    <span>Parcial:</span>
+    <button class="dist-btn${dist === 25 ? ' active' : ''}" ${locked ? 'disabled' : ''} onclick="setSplitDistance(25)">25m</button>
+    <button class="dist-btn${dist === 50 ? ' active' : ''}" ${locked ? 'disabled' : ''} onclick="setSplitDistance(50)">50m</button>
+    ${locked ? '<span class="locked-note">bloqueado</span>' : ''}
+  </div>`;
+}
+
+function renderLiveSplits() {
+  const session = S.activeSession;
+  if (!session || !hasSplits(session)) return '<div class="empty-state" style="padding:18px 8px;">Sem parciais registados nesta sessão.</div>';
+
+  const athleteIds = Object.keys(session.splitsByAthlete).filter((aid) => session.splitsByAthlete[aid]?.length);
+  return `<div class="live-split-groups">${athleteIds.map((aid) => {
+    const athlete = S.athletes.find((a) => String(a.id) === String(aid));
+    const name = athlete?.nome || session.splitsByAthlete[aid][0]?.athleteName || 'Atleta';
+    return `<div class="live-split-group">
+      <div class="live-split-title">${esc(name)} <span>${session.splitsByAthlete[aid].length} parcial${session.splitsByAthlete[aid].length !== 1 ? 'is' : ''}</span></div>
+      <div class="live-split-table">${session.splitsByAthlete[aid].map((s) => `<div class="live-split-row">
+        <span>${esc(s.label || `#${s.splitNo}`)}</span>
+        <strong>${fmtTime(s.cum)}</strong>
+        <span>${fmtTime(s.lap)}</span>
+        ${s.targetDiffMs !== null && s.targetDiffMs !== undefined ? `<span class="${s.targetDiffMs > 0 ? 'lap-slow' : 'lap-fast'}">${s.targetDiffMs >= 0 ? '+' : ''}${fmtTime(Math.abs(s.targetDiffMs))}</span>` : '<span></span>'}
+        <button onclick="deleteLiveSplit('${esc(aid)}','${esc(s.id)}')">✕</button>
+      </div>`).join('')}</div>
+    </div>`;
+  }).join('')}</div>`;
+}
+
+function renderLiveTimingPanel() {
+  const ex = getTimingExercise();
+  const session = S.activeSession;
+  const elapsed = getLiveElapsed(session);
+  const activeAthlete = S.athletes.find((a) => String(a.id) === String(S.activeAthleteId));
+  const next = activeAthlete ? nextSplitInfoForAthlete(String(activeAthlete.id)) : null;
+  const canSplit = !!session?.running && !!activeAthlete;
+  const finished = session?.status === 'finished';
+
+  if (!ex) {
+    return `<div class="card live-panel"><div class="empty-state"><div style="font-size:32px;margin-bottom:8px;">🏊</div><div>Selecione um exercício no plano.</div><div style="margin-top:4px;">A cronometragem só fica útil quando está ligada a uma linha exata do treino.</div></div></div>`;
+  }
+
+  return `<div class="live-panel">
+    <div class="live-ex-card">
+      <div class="selected-kicker">A cronometrar</div>
+      <div class="live-ex-title">${esc(ex.blockName)} — ${esc(ex.zona || '—')}</div>
+      <div class="live-ex-desc">${esc(ex.desc || '—')}</div>
+      <div class="live-ex-meta">${esc(ex.day)} · ${esc(ex.sessionLabel)} · ${esc(ex.pool || 'Piscina?')} · ${ex.metros ? `${ex.metros}m` : 'metros?'}${ex.ciclo ? ` · ${esc(ex.ciclo)}` : ''}${ex.target ? ` · Alvo total ${esc(ex.target)}` : ''}</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Atleta ativo</div>
+      ${renderAthleteChips()}
+    </div>
+
+    <div class="card">
+      <div class="live-controls-head">
+        ${renderSplitDistanceSelector()}
+        <div class="next-split">${next ? `Próximo: <strong>${esc(next.label)}</strong>` : 'Selecione atleta'}</div>
+      </div>
+      <div class="sw-display" id="swDisp">${fmtTime(elapsed)}</div>
+      <div class="sw-info">${totalSplitCount(session)} parcial${totalSplitCount(session) !== 1 ? 'is' : ''}${finished ? ' · sessão terminada' : ''}</div>
+      <div class="sw-controls live-controls">
+        <button class="sw-btn start" onclick="toggleLiveSW()" ${finished ? 'disabled' : ''}>${session?.running ? 'Parar' : session?.elapsed ? 'Retomar' : 'Iniciar'}</button>
+        <button class="sw-btn split" onclick="takeLiveSplit()" ${!canSplit || finished ? 'disabled' : ''}>${activeAthlete ? `Split ${esc(activeAthlete.nome)}` : 'Split'}</button>
+        <button class="sw-btn split" onclick="undoLastLiveSplit()" ${!session?.history?.length || finished ? 'disabled' : ''}>Undo</button>
+      </div>
+      <div class="finish-row">
+        ${finished ? '<button class="btn btn-secondary" onclick="clearFinishedSession()">Iniciar próximo exercício</button><button class="btn btn-primary" onclick="showTab(\'resultados\')">Ver resultados</button>' : `<button class="btn btn-success" onclick="finishLiveSession()" ${!hasSplits(session) ? 'disabled' : ''}>Terminar exercício</button><button class="btn btn-danger" onclick="discardActiveSession()">Descartar</button>`}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Parciais por atleta</div>
+      ${renderLiveSplits()}
+    </div>
+  </div>`;
+}
+
+function renderLive() {
+  const day = S.weekPlan[S.dayIdx] || {};
+  const blocks = day[S.sessao] || [];
+  const totalP = blocks.filter((b) => !b.isHeader).reduce((a, b) => a + (parseMeters(b.metros) || 0), 0);
+  const piscina = day.piscina || '';
+  return `<div class="live-layout">
+    <aside class="live-left">
+      ${dayTabsHTML()}
+      <div class="live-left-head">
+        <div><strong>${esc(DIAS[S.dayIdx])} — ${S.sessao === 'manha' ? 'Manhã' : 'Tarde'}</strong>${piscina ? `<span class="tag">${esc(piscina)}</span>` : ''}</div>
+        <span>${totalP}m</span>
+      </div>
+      ${renderExerciseSections(S.dayIdx, S.sessao, { goLive: true })}
+    </aside>
+    <section class="live-right">
+      ${renderLiveTimingPanel()}
+    </section>
+  </div>`;
+}
+
+function renderCrono() {
+  return `${dayTabsHTML()}${selectedExerciseBannerHTML()}${renderLiveTimingPanel()}`;
 }
 
 // ============================================================
@@ -718,6 +1158,7 @@ function renderZonas() {
   const pct = totalP ? Math.round((totalL / totalP) * 100) : 0;
 
   let html = dayTabsHTML();
+  html += selectedExerciseBannerHTML();
   html += `<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px;">
     <div class="zone-metric"><div class="lbl">Planeado</div><div class="val">${totalP}m</div></div>
     <div class="zone-metric"><div class="lbl">Realizado</div><div class="val">${totalL}m</div></div>
@@ -822,7 +1263,7 @@ function addAthlete() {
   if (!nome) { toast('Introduza o nome.'); return; }
   const athlete = { id: Date.now(), nome, grupo };
   S.athletes.push(athlete);
-  if (!S.cronoAthleteId) S.cronoAthleteId = String(athlete.id);
+  if (!S.activeAthleteId) S.activeAthleteId = String(athlete.id);
   saveState();
   renderTab();
   toast(`${nome} adicionado!`);
@@ -837,7 +1278,7 @@ function removeAthlete(id) {
 
 function confirmRemoveAthlete(id) {
   S.athletes = S.athletes.filter((a) => a.id !== id);
-  if (String(S.cronoAthleteId) === String(id)) S.cronoAthleteId = '';
+  if (String(S.activeAthleteId) === String(id)) S.activeAthleteId = '';
   saveState();
   closeModal();
   renderTab();
@@ -868,16 +1309,15 @@ function renderResultados() {
   } else {
     html += data.slice().reverse().map((r) => {
       const avg = r.splits.reduce((a, s) => a + s.lap, 0) / (r.splits.length || 1);
-      const targetMs = parseTargetTime(r.targetTime);
       return `<div class="result-card"><div class="result-header">
-        <div><div class="result-name">${esc(r.athlete)}</div><div class="result-meta">${esc(r.dia)} · ${r.sessao === 'manha' ? 'Manhã' : 'Tarde'} · ${esc(r.date)} · ${esc(r.bloco)}${r.targetTime ? ` · Alvo ${esc(r.targetTime)}` : ''}</div></div>
-        <button class="btn btn-danger btn-sm" onclick="deleteResult(${Number(r.id)})">✕</button>
+        <div><div class="result-name">${esc(r.athlete)}</div><div class="result-meta">${esc(r.dia)} · ${r.sessao === 'manha' ? 'Manhã' : 'Tarde'} · ${esc(r.date)} · ${esc(r.bloco)}${r.exerciseDesc ? ` · ${esc(r.exerciseDesc)}` : ''}${r.zone ? ` · ${esc(r.zone)}` : ''}${r.targetTime ? ` · Alvo total ${esc(r.targetTime)}` : ''}</div></div>
+        <button class="btn btn-danger btn-sm" onclick="deleteResult('${esc(r.id)}')">✕</button>
       </div><div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums;">
-        <thead><tr style="color:#4a6490;"><th style="text-align:left;padding:4px 6px;">Parcial</th><th style="text-align:right;padding:4px 6px;">Acum.</th><th style="text-align:right;padding:4px 6px;">Volta</th><th style="text-align:right;padding:4px 6px;">vs Média</th>${targetMs ? '<th style="text-align:right;padding:4px 6px;">vs Alvo</th>' : ''}</tr></thead>
+        <thead><tr style="color:#4a6490;"><th style="text-align:left;padding:4px 6px;">Parcial</th><th style="text-align:right;padding:4px 6px;">Acum.</th><th style="text-align:right;padding:4px 6px;">Volta</th><th style="text-align:right;padding:4px 6px;">vs Média</th><th style="text-align:right;padding:4px 6px;">vs Alvo</th></tr></thead>
         <tbody>${r.splits.map((s, i) => {
           const d = s.lap - avg;
-          const targetDiff = targetMs ? s.lap - targetMs : 0;
-          return `<tr style="border-top:1px solid #111d33;"><td style="padding:5px 6px;color:#4a6490;">#${i + 1}</td><td style="text-align:right;padding:5px 6px;color:#a8c0e0;font-weight:600;">${fmtTime(s.cum)}</td><td style="text-align:right;padding:5px 6px;color:#6b85a8;">${fmtTime(s.lap)}</td><td style="text-align:right;padding:5px 6px;" class="${i > 0 ? (d > 0 ? 'lap-slow' : 'lap-fast') : ''}">${i > 0 ? `${d >= 0 ? '+' : ''}${fmtTime(Math.abs(d))}` : '—'}</td>${targetMs ? `<td style="text-align:right;padding:5px 6px;" class="${targetDiff > 0 ? 'lap-slow' : 'lap-fast'}">${targetDiff >= 0 ? '+' : ''}${fmtTime(Math.abs(targetDiff))}</td>` : ''}</tr>`;
+          const td = s.targetDiffMs;
+          return `<tr style="border-top:1px solid #111d33;"><td style="padding:5px 6px;color:#4a6490;">${esc(s.label || `#${i + 1}`)}</td><td style="text-align:right;padding:5px 6px;color:#a8c0e0;font-weight:600;">${fmtTime(s.cum)}</td><td style="text-align:right;padding:5px 6px;color:#6b85a8;">${fmtTime(s.lap)}</td><td style="text-align:right;padding:5px 6px;" class="${i > 0 ? (d > 0 ? 'lap-slow' : 'lap-fast') : ''}">${i > 0 ? `${d >= 0 ? '+' : ''}${fmtTime(Math.abs(d))}` : '—'}</td><td style="text-align:right;padding:5px 6px;" class="${td > 0 ? 'lap-slow' : 'lap-fast'}">${td === null || td === undefined ? '—' : `${td >= 0 ? '+' : ''}${fmtTime(Math.abs(td))}`}</td></tr>`;
         }).join('')}</tbody></table></div></div>`;
     }).join('');
   }
@@ -885,7 +1325,7 @@ function renderResultados() {
 }
 
 function deleteResult(id) {
-  S.results = S.results.filter((r) => r.id !== id);
+  S.results = S.results.filter((r) => String(r.id) !== String(id));
   saveState();
   renderTab();
   toast('Resultado apagado.');
@@ -893,17 +1333,29 @@ function deleteResult(id) {
 
 function exportCSV() {
   if (!S.results.length) { toast('Sem resultados para exportar.'); return; }
-  const rows = [['Data', 'Dia', 'Sessão', 'Atleta', 'Bloco', 'Alvo', 'Parcial', 'Acumulado', 'Volta']];
+  const rows = [[
+    'SessionID', 'Data', 'Dia', 'Sessão', 'Atleta', 'Bloco', 'Exercício', 'Zona', 'Metros', 'Piscina', 'SplitDistance', 'AlvoTotal', 'Parcial', 'Repetição', 'DistânciaParcial', 'DistânciaTotal', 'Acumulado', 'Volta', 'DeltaAlvoFinal'
+  ]];
   S.results.forEach((r) => r.splits.forEach((s, i) => rows.push([
+    r.sessionId || '',
     r.date,
     r.dia,
     r.sessao === 'manha' ? 'Manhã' : 'Tarde',
     r.athlete,
     r.bloco,
+    r.exerciseDesc || '',
+    r.zone || '',
+    r.meters || '',
+    r.pool || '',
+    r.splitDistance || '',
     r.targetTime || '',
-    i + 1,
+    s.label || i + 1,
+    s.repetition || '',
+    s.distanceMarker || '',
+    s.totalDistance || '',
     fmtTime(s.cum),
     fmtTime(s.lap),
+    s.targetDiffMs === null || s.targetDiffMs === undefined ? '' : `${s.targetDiffMs >= 0 ? '+' : '-'}${fmtTime(Math.abs(s.targetDiffMs))}`,
   ])));
   const csv = rows.map((r) => r.map((v) => JSON.stringify(String(v))).join(',')).join('\n');
   const url = URL.createObjectURL(new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' }));
@@ -951,5 +1403,5 @@ function toast(msg) {
 window.addEventListener('online', () => toast('Ligação restaurada.'));
 window.addEventListener('offline', () => toast('Modo offline ativado.'));
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && S.sw.running) requestWakeLock();
+  if (document.visibilityState === 'visible' && S.activeSession?.running) requestWakeLock();
 });
