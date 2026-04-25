@@ -3,9 +3,10 @@
   "short_name": "SwimCoach",
   "description": "Plataforma de gestão de treinos de natação",
   "start_url": "./index.html",
+  "scope": "./",
   "display": "standalone",
-  "background_color": "#ffffff",
-  "theme_color": "#185FA5",
+  "background_color": "#0a1628",
+  "theme_color": "#0a1628",
   "orientation": "portrait",
   "icons": [
     {
