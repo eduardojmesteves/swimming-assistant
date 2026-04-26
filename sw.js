@@ -1,4 +1,4 @@
-const CACHE = 'swimcoach-v7-phase4';
+const CACHE = 'swimcoach-v8-observability';
 const ASSETS = [
   './',
   './index.html',
