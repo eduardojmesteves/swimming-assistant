@@ -68,5 +68,25 @@
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="app.js" defer></script>
+
+  <!-- Vercel Web Analytics: static HTML/PWA integration.
+       If Vercel shows a project-specific unique path in the dashboard,
+       replace the src below with that exact path. -->
+  <script>
+    window.va = window.va || function () {
+      (window.vaq = window.vaq || []).push(arguments);
+    };
+  </script>
+  <script defer src="/_vercel/insights/script.js"></script>
+
+  <!-- Vercel Speed Insights: static HTML/PWA integration.
+       If Vercel shows a project-specific unique path in the dashboard,
+       replace the src below with that exact path. -->
+  <script>
+    window.si = window.si || function () {
+      (window.siq = window.siq || []).push(arguments);
+    };
+  </script>
+  <script defer src="/_vercel/speed-insights/script.js"></script>
 </body>
 </html>
