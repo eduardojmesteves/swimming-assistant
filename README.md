@@ -322,3 +322,33 @@ Lap time is calculated per swimmer:
 ```text
 lap = current cumulative time - previous cumulative time for the same swimmer
 ```
+
+## Reliable records and recovery
+
+Finished Live sessions are read-only. Use **Resultados** to correct saved splits; the original cumulative time, correction marker, and latest correction timestamp survive finishing and CSV export. Choose **Iniciar próximo exercício** before starting another Live session.
+
+Plans and exercises now have persistent identities. Replacing a week cannot silently attach old results to new rows. The result editor defaults to **Manter exercício atual**; choose another exercise explicitly to reassign it. Existing data is migrated automatically, preserving historical snapshots and active sessions. Historical results whose original plan cannot be identified stay detached until explicitly reassigned.
+
+If local storage fails, a persistent warning offers **Tentar guardar** and CSV export. Keep the page open until saving succeeds. Results remain in memory, but closing the page can lose unsaved changes. CSV exports result records only; full plan/athlete/zone backup and restore is not yet available.
+
+CSV now handles quotes, commas and multiline text correctly. Formula-leading text is prefixed with an apostrophe for spreadsheet safety, and the final `CorrigidoEm` column contains the latest correction timestamp when available. Older correction metadata that was already lost cannot be reconstructed.
+
+## Development and checks
+
+Serve this directory with a static HTTP server, for example:
+
+```sh
+python3 -m http.server 8000
+```
+
+There is no application dependency installation or build step. Run regression tests with Node 24:
+
+```sh
+node --check app.js
+node --check sw.js
+node --test tests/*.test.cjs
+```
+
+Pull requests run these checks in GitHub Actions. The tests cover correction persistence, finished-session safeguards, exercise identity migration, independent athlete timings, storage failures and CSV serialization using simulated browser APIs. Real tablet and offline-update testing remains necessary before deployment.
+
+See [the phased implementation plan](docs/implementation-plan.md) for migration details, validation scope, and the remaining import, SheetJS security, offline-update and accessibility work. The current CDN-hosted SheetJS 0.18.5 dependency has not yet been upgraded.

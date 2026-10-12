@@ -26,6 +26,12 @@
       </div>
     </div>
 
+    <div id="saveWarning" class="save-warning" role="alert" hidden>
+      <strong>Alterações não guardadas neste dispositivo.</strong>
+      Mantenha esta página aberta. Tente guardar novamente ou exporte os resultados em CSV.
+      <button class="btn btn-secondary btn-sm" onclick="saveState('Alterações guardadas.')">Tentar guardar</button>
+      <button class="btn btn-secondary btn-sm" onclick="exportCSV()">Exportar CSV</button>
+    </div>
     <main id="content"></main>
 
     <nav id="nav">

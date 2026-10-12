@@ -42,12 +42,14 @@ const HEADER_NAMES = ['AQUECIMENTO', 'TAREFA', 'RECUPERACAO', 'FOLGA'];
 let S = defaultState();
 let toastTimer = null;
 let wakeLock = null;
+let hasUnsavedChanges = false;
 
 function defaultState() {
   return {
     tab: 'plano',
     sessao: 'manha',
     dayIdx: ((new Date().getDay() + 6) % 7), // Monday = 0
+    planId: '',
     weekPlan: {},
     zonePlan: {},
     athletes: [],
@@ -194,6 +196,7 @@ function loadState() {
         athletes: Array.isArray(d.athletes) ? d.athletes : [],
         results: Array.isArray(d.results) ? d.results : [],
         zoneLog: d.zoneLog || {},
+        planId: d.planId || '',
         weekPlan: d.weekPlan || {},
         zonePlan: d.zonePlan || {},
         weekLabel: d.weekLabel || '',
@@ -203,6 +206,7 @@ function loadState() {
         liveSplitDistance: Number(d.liveSplitDistance) || 25,
         activeSession: d.activeSession || null,
       };
+      migrateExerciseIdentity();
       return;
     } catch (err) {
       console.warn('Ignoring broken saved state:', err);
@@ -210,12 +214,14 @@ function loadState() {
   }
 }
 
-function saveState() {
+function saveState(successMessage = '') {
   try {
+    ensurePlanIdentity();
     localStorage.setItem(STORE_KEY, JSON.stringify({
       athletes: S.athletes,
       results: S.results,
       zoneLog: S.zoneLog,
+      planId: S.planId,
       weekPlan: S.weekPlan,
       zonePlan: S.zonePlan,
       weekLabel: S.weekLabel,
@@ -225,9 +231,16 @@ function saveState() {
       liveSplitDistance: S.liveSplitDistance,
       activeSession: safeSessionForSave(S.activeSession),
     }));
+    hasUnsavedChanges = false;
+    if ($('saveWarning')) $('saveWarning').hidden = true;
+    if (successMessage) toast(successMessage);
+    return true;
   } catch (err) {
+    hasUnsavedChanges = true;
+    if ($('saveWarning')) $('saveWarning').hidden = false;
     console.warn('Save failed:', err);
-    toast('Não foi possível guardar localmente.');
+    toast('Alterações não guardadas. Tente guardar novamente.');
+    return false;
   }
 }
 
@@ -307,6 +320,50 @@ function dayTabsHTML() {
 // ============================================================
 // EXERCISE SELECTION
 // ============================================================
+function ensurePlanIdentity() {
+  if (!Object.keys(S.weekPlan).length) return;
+  S.planId ||= uid('plan');
+  Object.values(S.weekPlan).forEach((day) => {
+    ['manha', 'tarde'].forEach((sess) => {
+      (day[sess] || []).forEach((exercise) => {
+        if (!exercise.isHeader) exercise.id ||= uid('exercise');
+      });
+    });
+  });
+}
+
+function migrateExerciseIdentity() {
+  const legacy = (id) => /^\d+_(manha|tarde)_\d+$/.test(id || '');
+  ensurePlanIdentity();
+  // Positional IDs cannot prove which week's exercise a saved result belongs to.
+  const historicalIds = new Map();
+  S.results.forEach((result) => {
+    if (!legacy(result.exerciseId)) return;
+    const key = `${result.sessionId || result.id}:${result.exerciseId}`;
+    if (!historicalIds.has(key)) historicalIds.set(key, uid('legacyExercise'));
+    result.exerciseId = historicalIds.get(key);
+    result.planId = '';
+  });
+  const session = S.activeSession;
+  if (legacy(session?.exerciseSnapshot?.id)) {
+    const previousId = session.exerciseSnapshot.id;
+    session.exerciseId = uid('legacyExercise');
+    session.exerciseSnapshot = { ...session.exerciseSnapshot, id: session.exerciseId, planId: '' };
+    if (S.selectedExerciseId === previousId) {
+      S.selectedExerciseId = session.exerciseId;
+      S.selectedExercise = { ...session.exerciseSnapshot };
+    }
+  }
+  if (legacy(S.selectedExerciseId)) {
+    const [day, sess, index] = S.selectedExerciseId.split('_');
+    const snapshot = buildExerciseSnapshot(Number(day), sess, Number(index));
+    S.selectedExercise = snapshot;
+    S.selectedExerciseId = snapshot?.id || '';
+  }
+  // Persist assigned IDs once; future reloads retain them.
+  saveState();
+}
+
 function getBlocks(dayIdx = S.dayIdx, sess = S.sessao) {
   return (S.weekPlan[dayIdx] || {})[sess] || [];
 }
@@ -316,6 +373,7 @@ function getPool(dayIdx = S.dayIdx) {
 }
 
 function getExerciseEntries(dayIdx = S.dayIdx, sess = S.sessao) {
+  ensurePlanIdentity();
   const blocks = getBlocks(dayIdx, sess);
   const entries = [];
   let blockName = 'Sem bloco';
@@ -326,7 +384,7 @@ function getExerciseEntries(dayIdx = S.dayIdx, sess = S.sessao) {
       blockTipo = b.tipo || 'tarefa';
     } else {
       entries.push({
-        id: `${dayIdx}_${sess}_${idx}`,
+        id: b.id,
         dayIdx,
         sess,
         idx,
@@ -345,6 +403,7 @@ function buildExerciseSnapshot(dayIdx, sess, idx) {
   const ex = entry.ex;
   const snap = {
     id: entry.id,
+    planId: S.planId,
     dayIdx,
     sess,
     day: DIAS[dayIdx],
@@ -365,14 +424,10 @@ function buildExerciseSnapshot(dayIdx, sess, idx) {
 
 function getSelectedExercise() {
   if (!S.selectedExerciseId) return null;
-  const parts = S.selectedExerciseId.split('_');
-  if (parts.length >= 3) {
-    const idx = Number(parts[2]);
-    const fresh = buildExerciseSnapshot(Number(parts[0]), parts[1], idx);
-    if (fresh) {
-      S.selectedExercise = fresh;
-      return fresh;
-    }
+  const fresh = snapshotFromExerciseId(S.selectedExerciseId);
+  if (fresh) {
+    S.selectedExercise = fresh;
+    return fresh;
   }
   return S.selectedExercise || null;
 }
@@ -406,8 +461,7 @@ function selectExerciseByIndex(dayIdx, sess, idx, goLive = false) {
     S.liveSplitDistance = defaultSplitDistance(snap.pool);
   }
   syncSessionButtons();
-  saveState();
-  toast('Exercício selecionado.');
+  saveState('Exercício selecionado.');
   if (goLive) S.tab = 'live';
   renderTab();
 }
@@ -735,6 +789,7 @@ function clearCurrentPlan() {
     toast('Termine ou descarte a sessão ativa antes de limpar o plano.');
     return;
   }
+  S.planId = '';
   S.weekPlan = {};
   S.zonePlan = {};
   S.zoneLog = {};
@@ -743,10 +798,9 @@ function clearCurrentPlan() {
   S.selectedExercise = null;
   S.activeSession = null;
   S.liveSplitDistance = 25;
-  saveState();
+  saveState('Plano atual limpo. Atletas e resultados foram mantidos.');
   closeModal();
   renderTab();
-  toast('Plano atual limpo. Atletas e resultados foram mantidos.');
 }
 
 function showClearAllConfirm() {
@@ -777,11 +831,10 @@ function clearAllData() {
     localStorage.removeItem(STORE_KEY);
     OLD_STORE_KEYS.forEach((key) => localStorage.removeItem(key));
   } catch (_) {}
-  saveState();
+  saveState('Todos os dados foram apagados.');
   closeModal();
   syncSessionButtons();
   renderTab();
-  toast('Todos os dados foram apagados.');
 }
 
 // ============================================================
@@ -936,6 +989,7 @@ function applyPlan(parsed, merge) {
       closeModal();
       return;
     }
+    S.planId = uid('plan');
     S.weekPlan = parsed.plan;
     S.zonePlan = parsed.zonePl;
     S.zoneLog = {};
@@ -945,10 +999,9 @@ function applyPlan(parsed, merge) {
     S.weekLabel = String(parsed.filename || '').replace(/\.[^.]+$/, '') || 'Plano carregado';
   }
   if (merge && parsed.filename && !S.weekLabel) S.weekLabel = String(parsed.filename).replace(/\.[^.]+$/, '');
-  saveState();
+  saveState('Plano carregado com sucesso!');
   closeModal();
   renderTab();
-  toast('Plano carregado com sucesso!');
 }
 
 // ============================================================
@@ -1006,10 +1059,9 @@ function saveBlockModal() {
     S.zonePlan[key][zona] = (S.zonePlan[key][zona] || 0) + metros;
   }
 
-  saveState();
+  saveState('Bloco adicionado!');
   closeModal();
   renderTab();
-  toast('Bloco adicionado!');
 }
 
 // ============================================================
@@ -1022,6 +1074,7 @@ function currentSplitDistance() {
 }
 
 function setSplitDistance(value) {
+  if (S.activeSession?.status === 'finished') return;
   const dist = Number(value);
   if (![25, 50].includes(dist)) return;
   if (S.activeSession?.status === 'active' && hasSplits(S.activeSession)) {
@@ -1070,12 +1123,13 @@ function createLiveSession(snapshot) {
 }
 
 function ensureLiveSession() {
+  if (S.activeSession?.status === 'finished') return null;
   const snapshot = getSelectedExercise();
   if (!snapshot) {
     toast('Selecione primeiro um exercício no plano.');
     return null;
   }
-  if (!S.activeSession || S.activeSession.status === 'finished') {
+  if (!S.activeSession) {
     S.activeSession = createLiveSession(snapshot);
     saveState();
     return S.activeSession;
@@ -1213,6 +1267,7 @@ function recomputeAthleteSplits(athleteId) {
 }
 
 function undoLastLiveSplit() {
+  if (S.activeSession?.status !== 'active') return;
   const session = S.activeSession;
   if (!session?.history?.length) {
     toast('Sem parciais para anular.');
@@ -1222,20 +1277,19 @@ function undoLastLiveSplit() {
   const list = session.splitsByAthlete[last.athleteId] || [];
   session.splitsByAthlete[last.athleteId] = list.filter((s) => s.id !== last.splitId);
   recomputeAthleteSplits(last.athleteId);
-  saveState();
+  saveState('Último parcial anulado.');
   renderTab();
-  toast('Último parcial anulado.');
 }
 
 function deleteLiveSplit(athleteId, splitId) {
+  if (S.activeSession?.status !== 'active') return;
   const session = S.activeSession;
   if (!session?.splitsByAthlete?.[athleteId]) return;
   session.splitsByAthlete[athleteId] = session.splitsByAthlete[athleteId].filter((s) => s.id !== splitId);
   session.history = (session.history || []).filter((h) => h.splitId !== splitId);
   recomputeAthleteSplits(athleteId);
-  saveState();
+  saveState('Parcial removido.');
   renderTab();
-  toast('Parcial removido.');
 }
 
 function findLiveSplit(athleteId, splitId) {
@@ -1245,6 +1299,7 @@ function findLiveSplit(athleteId, splitId) {
 }
 
 function showEditLiveSplitModal(athleteId, splitId) {
+  if (S.activeSession?.status !== 'active') return;
   const split = findLiveSplit(athleteId, splitId);
   if (!split) {
     toast('Parcial não encontrado.');
@@ -1263,6 +1318,7 @@ function showEditLiveSplitModal(athleteId, splitId) {
 }
 
 function saveEditedLiveSplitTime(athleteId, splitId) {
+  if (S.activeSession?.status !== 'active') return;
   const split = findLiveSplit(athleteId, splitId);
   if (!split) {
     toast('Parcial não encontrado.');
@@ -1280,13 +1336,13 @@ function saveEditedLiveSplitTime(athleteId, splitId) {
   split.corrected = true;
   split.correctedAt = new Date().toISOString();
   recomputeAthleteSplits(athleteId);
-  saveState();
+  saveState('Tempo corrigido.');
   closeModal();
   renderTab();
-  toast('Tempo corrigido.');
 }
 
 function showMoveLiveSplitModal(athleteId, splitId) {
+  if (S.activeSession?.status !== 'active') return;
   const split = findLiveSplit(athleteId, splitId);
   if (!split) {
     toast('Parcial não encontrado.');
@@ -1314,6 +1370,7 @@ function showMoveLiveSplitModal(athleteId, splitId) {
 }
 
 function saveMoveLiveSplit(fromAthleteId, splitId) {
+  if (S.activeSession?.status !== 'active') return;
   const session = S.activeSession;
   const toAthleteId = String($('moveSplitAthlete')?.value || '');
   if (!session || !toAthleteId || String(fromAthleteId) === toAthleteId) {
@@ -1335,13 +1392,13 @@ function saveMoveLiveSplit(fromAthleteId, splitId) {
   (session.history || []).forEach((h) => { if (String(h.splitId) === String(splitId)) h.athleteId = toAthleteId; });
   recomputeAthleteSplits(fromAthleteId);
   recomputeAthleteSplits(toAthleteId);
-  saveState();
+  saveState('Parcial movido.');
   closeModal();
   renderTab();
-  toast('Parcial movido.');
 }
 
 function finishLiveSession() {
+  if (S.activeSession?.status !== 'active') return;
   const session = S.activeSession;
   if (!session || !hasSplits(session)) {
     toast('Sem parciais para terminar.');
@@ -1372,6 +1429,7 @@ function finishLiveSession() {
       athlete: athlete?.nome || splits[0]?.athleteName || 'Atleta',
       bloco: ex.blockName || '—',
       exerciseId: ex.id,
+      planId: ex.planId || '',
       exerciseDesc: ex.desc || '',
       zone: ex.zona || '',
       meters: ex.metros || 0,
@@ -1393,13 +1451,15 @@ function finishLiveSession() {
         targetExpectedMs: s.targetExpectedMs ?? null,
         lapTargetMs: s.lapTargetMs ?? null,
         targetDiffMs: s.targetDiffMs,
+        corrected: !!s.corrected,
+        originalCum: s.originalCum,
+        correctedAt: s.correctedAt,
       })),
     });
   });
   const loggedZone = autoLogFinishedSessionZone(session);
-  saveState();
+  saveState(loggedZone ? 'Sessão terminada, resultados guardados e zonas atualizadas.' : 'Sessão terminada e resultados guardados.');
   renderTab();
-  toast(loggedZone ? 'Sessão terminada, resultados guardados e zonas atualizadas.' : 'Sessão terminada e resultados guardados.');
 }
 
 function clearFinishedSession() {
@@ -1490,10 +1550,9 @@ function saveExerciseStructureFromModal() {
     manuallyEdited: true,
   }, session.exerciseSnapshot, splitDistance);
   session.exerciseSnapshot.structure = session.exerciseStructure;
-  saveState();
+  saveState('Estrutura guardada.');
   closeModal();
   renderTab();
-  toast('Estrutura guardada.');
 }
 
 function autoLogFinishedSessionZone(session) {
@@ -1527,7 +1586,7 @@ function renderAthleteChips() {
 }
 
 function renderSplitDistanceSelector() {
-  const locked = S.activeSession?.status === 'active' && hasSplits(S.activeSession);
+  const locked = S.activeSession?.status === 'finished' || hasSplits(S.activeSession);
   const dist = currentSplitDistance();
   return `<div class="split-distance">
     <span>Parcial:</span>
@@ -1539,6 +1598,7 @@ function renderSplitDistanceSelector() {
 
 function renderLiveSplits() {
   const session = S.activeSession;
+  if (session?.status === 'finished') return `<div class="info-bar">Sessão terminada. Consulte e corrija os parciais em <button class="btn btn-secondary btn-sm" onclick="showTab('resultados')">Resultados</button>.</div>`;
   if (!session || !hasSplits(session)) return '<div class="empty-state" style="padding:18px 8px;">Sem parciais registados nesta sessão.</div>';
 
   const athleteIds = Object.keys(session.splitsByAthlete).filter((aid) => session.splitsByAthlete[aid]?.length);
@@ -1713,9 +1773,8 @@ function registerZone() {
   const key = `${S.dayIdx}_${S.sessao}`;
   if (!S.zoneLog[key]) S.zoneLog[key] = zoneTotals();
   S.zoneLog[key][zona] = (S.zoneLog[key][zona] || 0) + metros;
-  saveState();
+  saveState(`+${metros}m na zona ${zona}`);
   renderTab();
-  toast(`+${metros}m na zona ${zona}`);
 }
 
 function clearZoneLog(zona) {
@@ -1757,9 +1816,8 @@ function addAthlete() {
   const athlete = { id: Date.now(), nome, grupo };
   S.athletes.push(athlete);
   if (!S.activeAthleteId) S.activeAthleteId = String(athlete.id);
-  saveState();
+  saveState(`${nome} adicionado!`);
   renderTab();
-  toast(`${nome} adicionado!`);
 }
 
 function removeAthlete(id) {
@@ -1772,10 +1830,9 @@ function removeAthlete(id) {
 function confirmRemoveAthlete(id) {
   S.athletes = S.athletes.filter((a) => a.id !== id);
   if (String(S.activeAthleteId) === String(id)) S.activeAthleteId = '';
-  saveState();
+  saveState('Atleta removido.');
   closeModal();
   renderTab();
-  toast('Atleta removido.');
 }
 
 // ============================================================
@@ -1789,6 +1846,7 @@ function resultSnapshot(result) {
   if (!result) return null;
   return {
     id: result.exerciseId || '',
+    planId: result.planId || '',
     dayIdx: result.diaIdx,
     sess: result.sessao,
     day: result.dia,
@@ -1831,7 +1889,7 @@ function recomputeResultSplits(result) {
   });
 }
 
-function exerciseOptionsHTML(selectedExerciseId = '') {
+function exerciseOptionsHTML() {
   const entries = [];
   Object.keys(S.weekPlan || {}).forEach((dayKey) => {
     ['manha', 'tarde'].forEach((sess) => {
@@ -1842,15 +1900,19 @@ function exerciseOptionsHTML(selectedExerciseId = '') {
   return '<option value="">Manter exercício atual</option>' + entries.map((entry) => {
     const snap = buildExerciseSnapshot(entry.dayIdx, entry.sess, entry.idx);
     const label = `${snap.day} · ${snap.sessionLabel} · ${snap.blockName} · ${snap.zona || '—'} · ${snap.desc || '—'}`;
-    return `<option value="${esc(snap.id)}" ${snap.id === selectedExerciseId ? 'selected' : ''}>${esc(label)}</option>`;
+    return `<option value="${esc(snap.id)}">${esc(label)}</option>`;
   }).join('');
 }
 
 function snapshotFromExerciseId(exerciseId) {
   if (!exerciseId) return null;
-  const parts = String(exerciseId).split('_');
-  if (parts.length < 3) return null;
-  return buildExerciseSnapshot(Number(parts[0]), parts[1], Number(parts[2]));
+  for (const dayKey of Object.keys(S.weekPlan)) {
+    for (const sess of ['manha', 'tarde']) {
+      const entry = getExerciseEntries(Number(dayKey), sess).find((e) => e.id === exerciseId);
+      if (entry) return buildExerciseSnapshot(entry.dayIdx, sess, entry.idx);
+    }
+  }
+  return null;
 }
 
 function applySnapshotToResult(result, snap) {
@@ -1860,6 +1922,7 @@ function applySnapshotToResult(result, snap) {
   result.sessao = snap.sess;
   result.bloco = snap.blockName || '—';
   result.exerciseId = snap.id;
+  result.planId = snap.planId || '';
   result.exerciseDesc = snap.desc || '';
   result.zone = snap.zona || '';
   result.meters = snap.metros || 0;
@@ -1887,7 +1950,7 @@ function showEditResultModal(resultId) {
       <label style="flex:1;"><span class="form-label">Atleta</span><select class="sel" id="editResultAthlete">${athleteOptions}</select></label>
     </div>
     <div class="form-row">
-      <label style="flex:1;"><span class="form-label">Exercício</span><select class="sel" id="editResultExercise">${exerciseOptionsHTML(result.exerciseId)}</select></label>
+      <label style="flex:1;"><span class="form-label">Exercício</span><select class="sel" id="editResultExercise">${exerciseOptionsHTML()}</select></label>
     </div>
     <div class="info-bar">Atual: <strong>${esc(result.athlete)}</strong> · ${esc(result.bloco)} · ${esc(result.exerciseDesc || '—')}</div>`,
     [
@@ -1913,10 +1976,9 @@ function saveResultEdit(resultId) {
   if (snap) applySnapshotToResult(result, snap);
   else recomputeResultSplits(result);
   result.lastEditedAt = new Date().toISOString();
-  saveState();
+  saveState('Resultado atualizado.');
   closeModal();
   renderTab();
-  toast('Resultado atualizado.');
 }
 
 function findResultSplit(resultId, splitId) {
@@ -1957,12 +2019,12 @@ function saveEditedResultSplitTime(resultId, splitId) {
   if (split.originalCum === undefined) split.originalCum = split.cum;
   split.cum = ms;
   split.corrected = true;
+  split.correctedAt = new Date().toISOString();
   result.lastEditedAt = new Date().toISOString();
   recomputeResultSplits(result);
-  saveState();
+  saveState('Tempo corrigido.');
   closeModal();
   renderTab();
-  toast('Tempo corrigido.');
 }
 
 function deleteResultSplit(resultId, splitId) {
@@ -1971,13 +2033,11 @@ function deleteResultSplit(resultId, splitId) {
   result.splits = result.splits.filter((sp) => String(sp.id) !== String(splitId));
   if (!result.splits.length) {
     S.results = S.results.filter((r) => String(r.id) !== String(resultId));
-    toast('Resultado removido porque ficou sem parciais.');
   } else {
     result.lastEditedAt = new Date().toISOString();
     recomputeResultSplits(result);
-    toast('Parcial apagado.');
   }
-  saveState();
+  saveState(result.splits.length ? 'Parcial apagado.' : 'Resultado removido porque ficou sem parciais.');
   renderTab();
 }
 
@@ -2041,10 +2101,9 @@ function saveMoveResultSplit(fromResultId, splitId) {
     S.results = S.results.filter((r) => String(r.id) !== String(fromResultId));
   }
   recomputeResultSplits(toResult);
-  saveState();
+  saveState('Parcial movido.');
   closeModal();
   renderTab();
-  toast('Parcial movido.');
 }
 
 function renderResultados() {
@@ -2100,18 +2159,25 @@ function deleteResult(id) {
 
 function confirmDeleteResult(id) {
   S.results = S.results.filter((r) => String(r.id) !== String(id));
-  saveState();
+  saveState('Resultado apagado.');
   closeModal();
   renderTab();
-  toast('Resultado apagado.');
 }
 
-function exportCSV() {
-  if (!S.results.length) { toast('Sem resultados para exportar.'); return; }
+function serializeCSV(rows) {
+  return rows.map((row) => row.map((value) => {
+    let text = String(value ?? '');
+    // Quoting alone does not stop spreadsheets from evaluating formula text.
+    if (/^[\s\u0000-\u001f]*[=+@-]|^[\t\r\n]/.test(text)) text = "'" + text;
+    return '"' + text.replace(/"/g, '""') + '"';
+  }).join(',')).join('\r\n');
+}
+
+function resultsCSV(results) {
   const rows = [[
-    'SessionID', 'Data', 'Dia', 'Sessão', 'Atleta', 'Bloco', 'Exercício', 'Zona', 'Metros', 'Piscina', 'SplitDistance', 'AlvoTotal', 'Estrutura', 'Parcial', 'Repetição', 'DistânciaParcial', 'DistânciaTotal', 'Acumulado', 'Volta', 'AlvoAcumulado', 'DeltaAlvoAcumulado', 'Corrigido', 'OriginalAcumulado'
+    'SessionID', 'Data', 'Dia', 'Sessão', 'Atleta', 'Bloco', 'Exercício', 'Zona', 'Metros', 'Piscina', 'SplitDistance', 'AlvoTotal', 'Estrutura', 'Parcial', 'Repetição', 'DistânciaParcial', 'DistânciaTotal', 'Acumulado', 'Volta', 'AlvoAcumulado', 'DeltaAlvoAcumulado', 'Corrigido', 'OriginalAcumulado', 'CorrigidoEm'
   ]];
-  S.results.forEach((r) => r.splits.forEach((s, i) => rows.push([
+  results.forEach((r) => r.splits.forEach((s, i) => rows.push([
     r.sessionId || '',
     r.date,
     r.dia,
@@ -2135,8 +2201,14 @@ function exportCSV() {
     s.targetDiffMs === null || s.targetDiffMs === undefined ? '' : `${s.targetDiffMs >= 0 ? '+' : '-'}${fmtTime(Math.abs(s.targetDiffMs))}`,
     s.corrected ? 'sim' : '',
     s.originalCum === undefined ? '' : fmtTime(s.originalCum),
+    s.correctedAt || '',
   ])));
-  const csv = rows.map((r) => r.map((v) => JSON.stringify(String(v))).join(',')).join('\n');
+  return serializeCSV(rows);
+}
+
+function exportCSV() {
+  if (!S.results.length) { toast('Sem resultados para exportar.'); return; }
+  const csv = resultsCSV(S.results);
   const url = URL.createObjectURL(new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' }));
   const a = Object.assign(document.createElement('a'), {
     href: url,
@@ -2183,4 +2255,10 @@ window.addEventListener('online', () => toast('Ligação restaurada.'));
 window.addEventListener('offline', () => toast('Modo offline ativado.'));
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && S.activeSession?.running) requestWakeLock();
+});
+
+window.addEventListener('beforeunload', (event) => {
+  if (!hasUnsavedChanges) return;
+  event.preventDefault();
+  event.returnValue = '';
 });
